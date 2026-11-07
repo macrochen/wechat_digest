@@ -1,0 +1,22 @@
+{
+  "max_articles": 20,
+  "dedup_threshold": 0.75,
+  "batch_size": 15,
+  "max_parallel": 3,
+  "min_content_chars": 50,
+  "token_source": "~/workspace/daily_digest_hub/wechat/config/sources.yaml",
+  "publish_api": "https://zenmark-bxx.pages.dev/api/cloud/upload",
+  "publish_title_prefix": "公众号简报",
+  "lock_ttl_minutes": 20,
+  "ui": {
+    "logical_width": 1280,
+    "logical_height": 832,
+    "more_button": [1258, 101],
+    "copy_link": [1110, 300],
+    "close_window": [88, 108],
+    "open_wait": 2.5,
+    "menu_wait": 0.8,
+    "close_wait": 1.0,
+    "click_wait": 0.45
+  }
+}

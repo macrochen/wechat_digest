@@ -45,3 +45,10 @@ secrets.yaml
 .pytest_cache/
 .coverage
 htmlcov/
+
+# 本项目运行状态与产物（含候选池、正文、简报、失败留底）
+state/
+out/
+
+# 任何可能含令牌的本地覆盖配置
+config/settings.local.json
