@@ -1,0 +1,47 @@
+# Python 环境与构建缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境 (严格本地隔离)
+.venv/
+venv/
+ENV/
+env/
+
+# IDE 与操作系统临时文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 敏感信息与环境变量文件
+.env
+.env.local
+*.local.json
+secrets.yaml
+
+# 单元测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
