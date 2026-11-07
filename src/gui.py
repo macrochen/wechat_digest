@@ -12,9 +12,12 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import re
+import struct
 import subprocess
 import time
 from pathlib import Path
+
+from . import winpos
 
 _LIB = ctypes.util.find_library("ApplicationServices")
 if not _LIB:
@@ -130,8 +133,56 @@ def activate_wechat(wait: float = 1.2) -> None:
     time.sleep(wait)
 
 
+def frontmost_app() -> str | None:
+    """当前前台 App 的显示名（读 lsappinfo，不需要辅助功能权限）。
+
+    用来判断「菜单栏现在归谁」：只有微信是前台 App 时，点菜单栏才是
+    安全的（否则点到别人的菜单上，可能触发奇怪的动作）。判不出来返回 None。
+    """
+    try:
+        p = subprocess.run(["lsappinfo", "front"], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    asn = (p.stdout or "").strip()
+    if not asn:
+        return None
+    try:
+        q = subprocess.run(["lsappinfo", "info", "-only", "name", asn],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r'"LSDisplayName"="([^"]+)"', q.stdout or "")
+    return m.group(1) if m else None
+
+
+_WECHAT_NAMES = {"微信", "wechat"}
+
+
+def is_wechat_app(name: str | None) -> bool:
+    """这个名字是不是微信。
+
+    别用 `== "微信"` 精确比较：微信的 CFBundleDisplayName 是 `WeChat`，
+    而窗口所有者名（CGWindowOwnerName）是「微信」，`lsappinfo` 在不同
+    系统语言下可能给其中任意一个。只认中文名会「永远认为微信不在前台」，
+    于是反复点标题栏、最后误报失败。
+
+    但也**不能用包含匹配**：那样「企业微信 / WeChatWork」会被当成微信，
+    点击就跑到另一个 App 上去了。所以是规范化后的**精确**比较。
+    """
+    if not name:
+        return False
+    return name.strip().casefold() in _WECHAT_NAMES
+
+
 def screen_locked():
-    """返回 True/False/None（None = 无法判定，不误报）。"""
+    """返回 True/False/None（None = 无法判定，不误报）。
+
+    两条判据：ioreg 的 CGSSessionScreenIsLocked，以及前台 App 是否是
+    loginwindow（锁屏 / 登录窗口时它一定在最前，这是最靠谱的信号）。
+    """
+    if frontmost_app() == "loginwindow":
+        return True
     try:
         p = subprocess.run(["ioreg", "-n", "Root", "-d1", "-w0"],
                            capture_output=True, text=True, timeout=5)
@@ -163,6 +214,106 @@ def screenshot(out_path: str | Path, width: int = 1280,
     if s.returncode != 0 or not out.exists():
         raise RuntimeError("sips 缩放截图失败：" + (s.stderr or "").strip()[:160])
     return out
+
+
+def png_size(path: str | Path) -> tuple[int, int] | None:
+    """只读 PNG 的 IHDR 拿像素尺寸，不解码像素（读前 33 字节即可）。"""
+    try:
+        blob = Path(path).read_bytes()[:33]
+    except OSError:
+        return None
+    if len(blob) < 24 or blob[:8] != b"\x89PNG\r\n\x1a\n" or blob[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">II", blob[16:24])
+
+
+def screen_geometry(raw_out: str | Path = "/tmp/wd_geo_raw.png") -> dict:
+    """采集一次「真实屏幕几何」：主显示器逻辑尺寸 + 全屏截图的原始像素尺寸。
+
+    为什么要真的截一张图：`screencapture -x` 会把**所有**显示器拼成一张
+    （外接屏 / iPad 随航都算）。只看 CGDisplayBounds 发现不了这种拼合，
+    而拼合后 `sips -z 832 1280` 会把整块拼图压扁，一切像素判据失准——
+    而且不报错，只是静默点错卡片。
+
+    截屏失败（没权限 / 屏幕锁定）时 raw 返回 None、error 带原因，交给
+    调用方决定；本函数不抛异常。
+    """
+    display = winpos.main_display()
+    raw_size: tuple[int, int] | None = None
+    error: str | None = None
+    out = Path(raw_out)
+    try:
+        p = subprocess.run(["screencapture", "-x", str(out)],
+                           capture_output=True, text=True)
+        if p.returncode == 0 and out.exists():
+            raw_size = png_size(out)
+        else:
+            error = (p.stderr or "").strip()[:160] or "screencapture 返回非 0"
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = str(exc)[:160]
+    return {"display": display, "raw": raw_size, "error": error}
+
+
+def judge_geometry(*, expected_w: int, expected_h: int,
+                   display: dict | None = None,
+                   raw_size: tuple[int, int] | None = None,
+                   tolerance: float = 0.01) -> tuple[bool, list[dict]]:
+    """判断当前屏幕是否还满足「截图空间 == CGEvent 空间 == 期望尺寸」。
+
+    纯函数，不碰系统，便于单测。取不到的信息一律按「无法判定」跳过，
+    绝不因为查不到就报错——诊断信息缺失不该拦住正常抓取。
+
+    两条判据（任一条命中即不通过）：
+
+    1. **逻辑尺寸**必须等于期望值。CGEvent 点击用的是逻辑点坐标，屏幕换成
+       别的分辨率后，同一组数字会落到别处——这是最致命的一条。
+    2. **截图宽高比**必须与期望一致（容差 tolerance）。`sips -z` 是强制
+       拉伸而非等比缩放，比例一偏，1280x832 归一化空间里的所有像素阈值
+       （标题带 11~12px、36x36 图标、x=520..880 的暗像素数）全部失准。
+       这一条同时覆盖 `screencapture` 把扩展屏拼进同一张图的情况——左右
+       或上下拼接必然改变宽高比。
+
+    刻意**不**用 `CGDisplayPixelsWide` 校验 backing scale：本机实测
+    CGMainDisplayID 报 1280x832 / scale 1.0，而 `screencapture` 实际拍出
+    2560x1664（缩放分辨率模式下它返回的是逻辑值，不是 backing store）。
+    拿它当基准只会稳定误报。比例一致就足够——2x 等比缩放正是项目一直在
+    用的正常路径。
+    """
+    issues: list[dict] = []
+
+    if display:
+        dw, dh = float(display.get("w") or 0), float(display.get("h") or 0)
+        if dw > 0 and dh > 0:
+            if abs(dw - expected_w) > 1 or abs(dh - expected_h) > 1:
+                issues.append({
+                    "code": "logical_mismatch",
+                    "message": (
+                        f"主显示器逻辑尺寸是 {dw:g}x{dh:g}，不是 "
+                        f"{expected_w}x{expected_h}。点击坐标按 "
+                        f"{expected_w}x{expected_h} 发送，会整体偏移。"),
+                })
+
+    if raw_size:
+        rw, rh = raw_size
+        if expected_w > 0 and expected_h > 0 and rh > 0:
+            want = expected_w / expected_h
+            got = rw / rh
+            if abs(got - want) / want > tolerance:
+                extra = ""
+                n = int((display or {}).get("displays") or 0)
+                if n > 1:
+                    extra = (f"当前有 {n} 块活动显示器，`screencapture` 会把"
+                             f"扩展屏一起拼成一张图，这是最常见的原因；"
+                             f"接第二块屏或 iPad 随航后请重新校准坐标。")
+                issues.append({
+                    "code": "aspect_mismatch",
+                    "message": (
+                        f"全屏截图是 {rw}x{rh}（宽高比 {got:.4f}），与 "
+                        f"{expected_w}x{expected_h}（{want:.4f}）不一致，"
+                        f"缩放后画面会被拉扁，像素判据不可信。{extra}"),
+                })
+
+    return (not issues), issues
 
 
 def clipboard_read() -> str:
