@@ -1,6 +1,6 @@
 # wechat_digest 需求文档（PRD）
 
-> 版本：v1.0 ｜ 状态：**已确认** ｜ 创建日期：2026-11-07 ｜ 确认日期：2026-11-07
+> 版本：v1.1 ｜ 状态：**已确认** ｜ 创建日期：2026-11-07 ｜ 确认日期：2026-11-07 ｜ 最近修订：2026-11-07
 
 ## 1. 一句话定位
 
@@ -8,7 +8,7 @@
 
 只有我一个人用，没有界面、没有账号、不发布给别人。不接任何外部大模型 API，不用 API Key。
 
-**与 `daily_digest_hub` 的关系**：两个项目各自独立、各管各的，**不做任何跨项目去重或互查**，同一篇文章是否重复出现由我自己手工控制。
+**与 `daily_digest_hub` 的关系**：两个项目各自独立、各管各的，**不做任何跨项目去重或互查**，同一篇文章是否重复出现由我自己手工控制。**配置也完全独立**：ZenMark 令牌各存一份，本项目不读对方的任何文件。
 
 ## 2. 要解决的问题
 
@@ -44,7 +44,7 @@
 3. **内容过滤**：噪音行正则清掉「免责声明 / 扫码 / 长按 / 广告 / 阅读原文 / 在看 / 往期回顾」等；纯推广文由提示词标注 `[软文识别]`；主体有内容、只在末尾带推广的正常总结，忽略推广部分。
 4. **总结**：由**当前 WorkBuddy 会话的 Hy4** 完成，脚本不调用任何大模型 API。融合版提示词 —— 以 `daily_digest_hub/wechat/config/prompt.md` 为骨架（逐篇编号、`《标题》来源`、同一事件合并、禁破折号、25 字短句、200-400 字），补上 `gzh_articles_fetcher` 的 few-shot 示例与软文判断细则。输出**一份汇总** Markdown。
 5. **分批与并发**：批内篇数 **≥15 就拆批**（20 篇通常拆 2 批），**子代理并发上限 3**，同一事件簇不拆开；合并后逐条校验编号连续、无残留占位符。与 `daily_digest_hub/AGENTS.md` 铁律 6/7 一致。
-6. **推送阅读器**：沿用 ZenMark `POST https://zenmark-bxx.pages.dev/api/cloud/upload`，`Bearer` 令牌 + `{"title","content"}`。令牌**运行时直接读** `~/workspace/daily_digest_hub/wechat/config/sources.yaml` 的 `settings.publish.token`（只读，不复制进本项目、不写进 Git、不打印到日志）。发布失败才把正文留底，正常情况走 stdin 不落盘，与 `daily_digest_hub` 一致。
+6. **推送阅读器**：沿用 ZenMark `POST https://zenmark-bxx.pages.dev/api/cloud/upload`，`Bearer` 令牌 + `{"title","content"}`。令牌**由本项目自己配置一份**，与 `daily_digest_hub` 完全分开：运行时只读项目内 `config/secrets.local.json`（Git 忽略、权限 600），支持环境变量 `ZENMARK_API_TOKEN` 覆盖；**不读对方的任何文件**、不打印到日志、不提交到 Git。仓库里只提供不含真值的 `config/secrets.example.json` 模板。发布失败才把正文留底，正常情况走 stdin 不落盘。
 7. **可复查**：候选池、选文清单、去重台账、发布记录都落盘，能回答「这篇为什么没进简报」。
 
 ### 以后再说
@@ -58,13 +58,14 @@
 ### 明确不做
 
 - **不做跨项目去重**：不读 `daily_digest_hub` 的 `seen.json` / `_published.json`，不互查、不改对方、不设共享台账。两个项目各负责各的，重复由我自己控制。
+- **不读取 `daily_digest_hub` 的任何配置文件或状态文件**（包括 `sources.yaml`）；令牌也已改为项目内独立配置，两边彻底分开
 - **不接外部大模型 API**：不调 Gemini / OpenAI，不要 API Key，总结只用当前会话的 Hy4
 - **不做 RSS 订阅源**，不接 `wechat2rss`，不复制 `daily_digest_hub` 的 129 个号配置
 - **不做无人值守定时任务**，不做锁屏自动重试
 - **不做 Chrome 插件**，不在浏览器里注入脚本
 - **不做账号体系、云同步、多用户**
 - **不改两个参考项目**，只读它们、搬思路，不往回写
-- **不把 ZenMark 令牌复制进本项目**，也不提交到 Git
+- **不把含真值的令牌文件提交到 Git**；仓库里只保留不含真值的模板
 - **不做 GUI 适配层**：固定截屏 + `CGEventPost`，界面变了就报错让人介入，不自动重新识别
 
 ## 5. 怎么算做完了
@@ -78,9 +79,9 @@
 - [ ] 整个流程**没有任何对外部大模型 API 的网络请求**；总结内容由当前会话的 Hy4 产出。
 - [ ] 推送成功时 ZenMark 云端暂存区出现一份新文档；同一份简报再发一次应提示「内容没变，跳过」。
 - [ ] 正常发布时 `out/` 下不新增 `.md` 正文文件；发布失败时生成 `failed-<日期>.md` 留底。
-- [ ] 读不到 `daily_digest_hub` 的 `settings.publish.token` 时明确报错退出，不发送、不留残缺记录；本项目仓库里搜不到该令牌字符串。
+- [ ] 项目内 `config/secrets.local.json` 缺失或字段为空时明确报错退出，不发送、不留残缺记录；Git 仓库里搜不到真实令牌字符串。
+- [ ] **代码里搜不到 `daily_digest_hub` 路径**：本项目不读对方任何文件；`doctor` 自检能验证令牌可读且不显示值。
 - [ ] 微信未运行 / 屏幕锁定 / **界面坐标识别失败**时报错退出且**不写 `seen.json`**，提示人介入，下次可原样重试。
-- [ ] 项目内不存在任何读取或写入 `daily_digest_hub` 状态文件（除只读取令牌）的代码。
 
 ## 6. 技术方案要点
 
@@ -93,8 +94,9 @@
   - 分工：脚本提供 `capture`（截屏缩放）、`grab`（按 Hy4 给出的卡片坐标批量点开并复制链接）、`click` 等原子命令；视觉识别由 Hy4 承担，脚本不猜坐标。
 - **正文层（网络）**：GUI 只负责取链接。标题 / 公众号名 / 时间 / 正文全部用网络读取补齐 —— `mp.weixin.qq.com` 是公开页，`urllib` + UA 可拿到源码里的 `nickname`、`msg_title`、`publish_time` 时间戳（换算成北京时间）；必要时用精确标题反查长链。
 - **数据存哪**：纯本地文件，不建数据库。`state/seen.json`、`state/runs.json`、`state/published.json`、`out/inbox-<日期>.json`、`out/_plan/selected-<日期>.json`、`out/pending_summary.json`（待总结包：融合提示词 + 正文 JSON）。字段对齐提示词的 `title / url / content / source`。
-- **外部服务**：只有 ZenMark 上传接口与 `mp.weixin.qq.com` 页面读取。令牌从 `daily_digest_hub/wechat/config/sources.yaml` **运行时只读**（该路径可配置），不设 `ZENMARK_API_TOKEN`、不复制明文、不打印。
-- **参考来源（只读，不修改）**：
+- **令牌存哪（v1.1 改）**：**项目内独立一份** —— `config/secrets.local.json`，格式 `{"zenmark_token": "..."}`，`chmod 600`，由 `.gitignore` 的 `*.local.json` 忽略；`config/settings.json` 的 `token_file` 指向它；环境变量 `ZENMARK_API_TOKEN` 可覆盖（换机器/临时调试用）。仓库里提交 `config/secrets.example.json` 作为不含真值的模板。
+- **外部服务**：只有 ZenMark 上传接口与 `mp.weixin.qq.com` 页面读取。**完全不依赖 `daily_digest_hub`**：对方改目录、改令牌、删配置都不影响本项目；本项目也绝不读它的 `sources.yaml` 或任何状态文件。
+- **参考来源（只读思路，运行时不读取）**：
   - `gzh_articles_fetcher/options/options.js:152` — 默认总结提示词、软文识别、few-shot 示例
   - `gzh_articles_fetcher/utils.js`、`Readability.js` — 浏览器端正文抽取与清洗
   - `daily_digest_hub/wechat/config/prompt.md` — 日报版提示词、同事件合并规则
@@ -110,10 +112,10 @@
 | # | 决策项 | 结论 |
 | :--- | :--- | :--- |
 | 1 | 触发形态 | **A**：skill + WorkBuddy 里一句话，一次跑完全流程；终端命令仅作调试入口 |
-| 2 | 项目关系 | **不做跨项目去重**，各负责各的，重复由用户自己控制 |
+| 2 | 项目关系 | **不做跨项目去重**，各负责各的，重复由用户自己控制；**配置也各自独立** |
 | 3 | 抓取来源 | 本地微信客户端「公众号」**信息流**，每次 20 篇 |
 | 4 | 模型 | 当前 WorkBuddy 会话的 Hy4，零 API Key |
-| 5 | 令牌 | 运行时只读 `daily_digest_hub/wechat/config/sources.yaml` 的 `settings.publish.token` |
+| 5 | 令牌（v1.1 改） | **项目内独立配置一份** `config/secrets.local.json`（Git 忽略、权限 600），与 `daily_digest_hub` 完全分开、互不读取；环境变量可覆盖 |
 | 6 | GUI 方案 | **固定**截屏 + `CGEventPost`，不做适配层 |
 | 7 | 界面变化兜底 | 坐标识别失败**报错退出、不写状态、等人介入** |
 | 8 | 分批并发 | 批内 ≥15 篇拆批，**子代理并发 ≤3**，同事件簇不拆开 |
@@ -128,6 +130,7 @@
 | v0.1 | 2026-11-07 | 完成两轮访谈，补齐调研结论、四层去重设计、功能清单、验收标准与待定问题 |
 | v0.2 | 2026-11-07 | 模型改为当前会话 Hy4、令牌改读 `sources.yaml`、每次 20 篇、一份汇总简报、正文不落盘、按信息流取；新增运行原理调研结论 |
 | v1.0 | 2026-11-07 | **确认定稿**：删除跨项目不重复硬要求（各管各的、重复由用户控制）；GUI 固定截屏 + `CGEventPost` 不做适配层；坐标失效报错人介入；确定拆批 + 子代理并发 ≤3；触发形态定为 A；`.venv` 改用纯标准库零依赖绕开。待定问题全部关闭 |
+| v1.1 | 2026-11-07 | **令牌改为项目内独立配置**：不再读 `daily_digest_hub/sources.yaml`，改读 `config/secrets.local.json`（Git 忽略、权限 600）+ 模板 `secrets.example.json`，环境变量可覆盖；两项目配置彻底分开。同步功能清单、明确不做、验收项、技术方案、决策表 |
 
 ---
 
