@@ -4,7 +4,7 @@
   "batch_size": 15,
   "max_parallel": 3,
   "min_content_chars": 50,
-  "token_source": "~/workspace/daily_digest_hub/wechat/config/sources.yaml",
+  "token_file": "config/secrets.local.json",
   "publish_api": "https://zenmark-bxx.pages.dev/api/cloud/upload",
   "publish_title_prefix": "公众号简报",
   "lock_ttl_minutes": 20,

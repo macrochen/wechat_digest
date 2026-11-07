@@ -22,7 +22,7 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 CN = timezone(timedelta(hours=8))
 
-# 常见噪音行，照搬 daily_digest_hub/scripts/fetch.py:174
+# 常见噪音行，照搬已验证日报流水线的 JUNK 规则
 JUNK = re.compile(
     r"^(免责声明|版权|转载|点击|关注|扫码|长按|广告|本文|编辑|来源[:：]|"
     r"Tags?[:：]|标签[:：]|作者\s*$|阅读原文|分享|点赞|在看|写下你的留言|"

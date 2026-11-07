@@ -70,8 +70,8 @@ def cmd_doctor(cfg, args) -> int:
     if not pf.exists():
         ok = False
     try:
-        publish.read_token(cfg["token_source"])
-        print(f"· ZenMark 令牌：可读（来源 {Path(cfg['token_source']).name}，值不显示）")
+        _, where = publish.read_token(cfg)
+        print(f"· ZenMark 令牌：可读（来源 {where}，值不显示）")
     except publish.PublishError as exc:
         print(f"  × {exc}"); ok = False
     print(f"· 每批上限 {cfg['batch_size']} 篇 / 子代理并发 ≤{cfg['max_parallel']}"

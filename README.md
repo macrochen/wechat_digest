@@ -62,7 +62,18 @@ python3 -m src.main merge | python3 -m src.main publish --stdin   # 7+8. 合并�
 
 ## 令牌与隐私
 
-ZenMark 令牌**运行时只读** `~/workspace/daily_digest_hub/wechat/config/sources.yaml` 的 `settings.publish.token`。本项目不复制、不打印、不提交该值；路径可在 `config/settings.json` 的 `token_source` 改。
+ZenMark 令牌在**本项目内独立配置一份**，与 `daily_digest_hub` 完全分开、互不读取：
+
+```bash
+cp config/secrets.example.json config/secrets.local.json
+# 编辑 config/secrets.local.json，填入 zenmark_token
+chmod 600 config/secrets.local.json
+```
+
+- `*.local.json` 已被 `.gitignore` 忽略，真值不会进 Git；仓库里只有不含真值的模板
+- 运行时读 `config/settings.json` 里 `token_file` 指向的文件，可用环境变量 `ZENMARK_API_TOKEN` 覆盖（换机器或临时调试用）
+- 令牌不打印、不写日志；本机已配置好，用 `python3 -m src.main doctor` 验证
+- **本项目不读取 `daily_digest_hub` 的任何文件**，对方改目录、改令牌都不影响这边
 
 ## 界面变化怎么办（人介入）
 
@@ -72,7 +83,7 @@ GUI 固定用 `screencapture` + `sips` 缩到 1280×832 逻辑坐标 + `CGEventP
 
 ## 与 daily_digest_hub 的关系
 
-两个项目**各负责各的，不做任何跨项目去重或互查**。同一篇文章是否重复出现在两边简报里，由使用者自己控制。本项目只从对方 `sources.yaml` 读令牌，不读它的 `seen.json` / `_published.json`，也不往回写。
+两个项目**各负责各的，不做任何跨项目去重或互查**，配置也各自独立。同一篇文章是否重复出现在两边简报里，由使用者自己控制。令牌各存一份：`daily_digest_hub` 用它自己的 `sources.yaml`，本项目用 `config/secrets.local.json`；**互不读取、不往回写**，任何一边换令牌或搬目录都不影响另一边。
 
 ## 目录结构
 
@@ -89,7 +100,9 @@ wechat_digest/
 │   ├── prompt.py         # 待总结包 / 拆批 / 合并校验
 │   └── publish.py        # ZenMark 推送
 ├── prompts/summary.md    # 融合提示词
-├── config/settings.json  # 可调项（不含令牌）
+├── config/settings.json          # 可调项（不含令牌）
+├── config/secrets.example.json   # 令牌模板（不含真值，提交到 Git）
+├── config/secrets.local.json     # 实际令牌（Git 忽略，权限 600）
 ├── docs/PRD.md
 ├── tests/
 ├── state/                # 台账（Git 忽略）

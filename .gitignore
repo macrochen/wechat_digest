@@ -51,4 +51,7 @@ state/
 out/
 
 # 任何可能含令牌的本地覆盖配置
+# （*.local.json 已在上面忽略，这里显式列出令牌文件，避免误提交）
 config/settings.local.json
+config/secrets.local.json
+config/secrets.json

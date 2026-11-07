@@ -3,7 +3,7 @@
 """四层审核去重台账：seen / 相似度 / 幂等 runs / 发布哈希 / 认领锁。
 
 纯本地 JSON，原子写。所有状态只在「成功」时落盘；GUI 抓取失败不写任何台账。
-参考 daily_digest_hub 的 seen.json、runs.json、_published.json 与认领锁做法。
+参考已验证日报流水线的 seen.json / runs.json / published.json 与认领锁做法。
 """
 
 from __future__ import annotations

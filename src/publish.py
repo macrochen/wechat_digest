@@ -2,20 +2,20 @@
 # -*- coding: utf-8 -*-
 """把汇总简报推到 ZenMark 阅读器。
 
-接口对齐 daily_digest_hub/scripts/publish.py：
+接口说明（参考项目的实现思路，运行时不读取任何外部项目文件）：
   POST <api>   Authorization: Bearer <token>
   body {"title": ..., "content": <markdown>}
   返回 {"success": true, "item": {"id": "cloud_xxx"}}
 
-令牌**运行时只读** daily_digest_hub/wechat/config/sources.yaml 的
-settings.publish.token，不复制进本项目、不打印、不写日志、不提交 Git。
+令牌从**本项目内** config/secrets.local.json 运行时只读（Git 忽略、权限 600），
+可用环境变量 ZENMARK_API_TOKEN 覆盖。不读其它项目任何文件、不打印、不提交 Git。
 正文走 stdin，正常情况不落盘；只有发布失败才留 out/failed-<日期>.md。
 """
 
 from __future__ import annotations
 
 import json
-import re
+import os
 import subprocess
 import sys
 import urllib.request
@@ -32,32 +32,31 @@ class PublishError(RuntimeError):
     pass
 
 
-def read_token(source: str) -> str:
-    """不依赖 PyYAML，只按缩进定位 settings.publish.token。"""
-    p = Path(source)
+def read_token(cfg: dict):
+    """返回 (token, 来源描述)。只读本项目配置，绝不读外部项目。
+
+    优先级：环境变量 ZENMARK_API_TOKEN > config/secrets.local.json。
+    """
+    env = os.environ.get("ZENMARK_API_TOKEN", "").strip()
+    if env:
+        return env, "环境变量 ZENMARK_API_TOKEN"
+
+    p = Path(cfg["token_file"])
     if not p.exists():
         raise PublishError(
-            f"找不到令牌来源文件：{p}\n"
-            "  请检查 config/settings.json 的 token_source 路径")
-    publish_indent = None
-    for line in p.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if publish_indent is None:
-            if re.match(r"^publish\s*:", s):
-                publish_indent = indent
-            continue
-        if indent <= publish_indent:
-            break
-        m = re.match(r"^token\s*:\s*(.+)$", s)
-        if m:
-            token = m.group(1).split(" #")[0].strip().strip("\"'").strip()
-            if token:
-                return token
-    raise PublishError(
-        f"在 {p} 里没找到 settings.publish.token，不发送、不留残缺记录")
+            f"找不到项目内令牌文件：{p}\n"
+            "  请执行 cp config/secrets.example.json config/secrets.local.json "
+            "并填入 zenmark_token")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PublishError(f"令牌文件读不了：{p}（{exc}）")
+    if not isinstance(data, dict):
+        raise PublishError(f"{p} 格式不对，应为 JSON 对象")
+    token = str(data.get("zenmark_token") or data.get("token") or "").strip()
+    if not token:
+        raise PublishError(f"{p} 里没有 zenmark_token，不发送、不留残缺记录")
+    return token, p.name
 
 
 def _headers(token: str, json_body: bool = True) -> dict:
@@ -128,9 +127,7 @@ def check_token(api: str, token: str):
 def publish(cfg: dict, text: str, title: str | None = None,
             dry_run: bool = False, check: bool = False) -> int:
     api = cfg["publish_api"]
-    source = cfg["token_source"]
-    token = read_token(source)  # 只读，绝不打印值
-    where = Path(source).name
+    token, where = read_token(cfg)  # 只读项目内配置，绝不打印值
 
     if check:
         ok, res = check_token(api, token)

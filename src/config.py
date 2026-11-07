@@ -3,7 +3,7 @@
 """路径与运行配置。
 
 所有可调项集中在 config/settings.json。注意：令牌**不在**这里，
-运行时才从 daily_digest_hub 的 sources.yaml 只读加载。
+运行时才从项目内独立的 config/secrets.local.json 只读加载。
 """
 
 from __future__ import annotations
@@ -18,14 +18,14 @@ DEFAULTS = {
     "max_articles": 20,
     # 字符 5-gram Jaccard 阈值，>= 视为转载（实测真转载约 0.93）
     "dedup_threshold": 0.75,
-    # 批内篇数达到这个数就拆批（对齐 daily_digest_hub 铁律 6）
+    # 批内篇数达到这个数就拆批（对齐参考项目的拆批规则）
     "batch_size": 15,
     # 子代理并发上限（对齐铁律 5）
     "max_parallel": 3,
     # 正文短于这个字数，交给提示词标「内容无法总结」
     "min_content_chars": 50,
-    # 只读取令牌的外部配置路径
-    "token_source": "~/workspace/daily_digest_hub/wechat/config/sources.yaml",
+    # 项目内独立令牌文件（Git 忽略、权限 600），相对项目根；可用环境变量覆盖
+    "token_file": "config/secrets.local.json",
     "publish_api": "https://zenmark-bxx.pages.dev/api/cloud/upload",
     "publish_title_prefix": "公众号简报",
     # 运行认领锁超时（分钟）
@@ -65,7 +65,8 @@ def load_settings() -> dict:
             cfg = _deep_merge(cfg, json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError) as exc:
             raise SystemExit(f"× 配置文件读不了：{path}（{exc}）")
-    cfg["token_source"] = str(Path(cfg["token_source"]).expanduser())
+    tf = Path(cfg["token_file"]).expanduser()
+    cfg["token_file"] = str(tf if tf.is_absolute() else ROOT / tf)
     return cfg
 
 

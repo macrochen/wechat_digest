@@ -3,6 +3,7 @@
 """核心逻辑单测：全部用构造数据，不碰微信、不发网络请求、不改真实台账。"""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -140,27 +141,48 @@ class TestSelection(unittest.TestCase):
 
 
 class TestToken(unittest.TestCase):
-    def test_read_token_without_yaml_lib(self):
+    def test_read_local_token(self):
         with tempfile.TemporaryDirectory() as tmp:
-            f = Path(tmp) / "sources.yaml"
-            f.write_text(
-                "settings:\n"
-                "  lookback_hours: 36\n"
-                '  token: "不该读到的顶层令牌"\n'
-                "  publish:\n"
-                "    enabled: true\n"
-                '    api: "https://example.com/api/cloud/upload"\n'
-                '    token: "TEST_TOKEN_abc+;=:xyz"\n'
-                "  dedup: true\n", encoding="utf-8")
-            self.assertEqual(publish.read_token(str(f)),
-                             "TEST_TOKEN_abc+;=:xyz")
+            f = Path(tmp) / "secrets.local.json"
+            f.write_text(json.dumps({"zenmark_token": "TEST_TOKEN_abc+;=:xyz"}),
+                         encoding="utf-8")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                token, where = publish.read_token({"token_file": str(f)})
+            self.assertEqual(token, "TEST_TOKEN_abc+;=:xyz")
+            self.assertEqual(where, "secrets.local.json")
 
-    def test_missing_token_raises(self):
+    def test_env_overrides_file(self):
         with tempfile.TemporaryDirectory() as tmp:
-            f = Path(tmp) / "empty.yaml"
-            f.write_text("settings:\n  dedup: true\n", encoding="utf-8")
+            f = Path(tmp) / "secrets.local.json"
+            f.write_text(json.dumps({"zenmark_token": "FROM_FILE"}),
+                         encoding="utf-8")
+            with mock.patch.dict(os.environ, {"ZENMARK_API_TOKEN": "FROM_ENV"}):
+                token, where = publish.read_token({"token_file": str(f)})
+            self.assertEqual(token, "FROM_ENV")
+            self.assertIn("环境变量", where)
+
+    def test_missing_file_raises(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(publish.PublishError):
-                publish.read_token(str(f))
+                publish.read_token({"token_file": "/tmp/definitely-no-token.json"})
+
+    def test_empty_token_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "secrets.local.json"
+            f.write_text(json.dumps({"zenmark_token": ""}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(publish.PublishError):
+                    publish.read_token({"token_file": str(f)})
+
+
+class TestIsolation(unittest.TestCase):
+    def test_src_never_references_external_project(self):
+        src_dir = Path(__file__).resolve().parents[1] / "src"
+        for f in src_dir.glob("*.py"):
+            text = f.read_text(encoding="utf-8")
+            for forbidden in ("daily_digest_hub", "sources.yaml", "token_source"):
+                self.assertNotIn(forbidden, text,
+                                 f"{f.name} 不应出现 {forbidden}")
 
 
 class TestLedger(unittest.TestCase):
