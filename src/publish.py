@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import archive
-from .config import project_path
+from .config import pending_file, project_path
 from .state import ClaimLock, Published, Runs, Seen, load_json, sha256_text
 
 TIMEOUT = 60  # 该接口实测 1~20 秒都有，30 秒会误判
@@ -144,7 +144,7 @@ def _archive(text: str, *, title: str, kind: str, status: str,
 
 def publish(cfg: dict, text: str, title: str | None = None,
             dry_run: bool = False, check: bool = False,
-            no_ledger: bool = False) -> int:
+            no_ledger: bool = False, scope: str = "") -> int:
     """推 ZenMark。no_ledger=True 是语音播报版等旁路发布：
 
     不查 run_key 去重、不写 seen / runs / published、不释放锁。
@@ -168,11 +168,13 @@ def publish(cfg: dict, text: str, title: str | None = None,
         print("× 没有内容可发（stdin 是空的）")
         return 1
 
-    pending_path = project_path("out", "pending_summary.json")
+    pending_path = project_path("out", pending_file(scope))
     pending = load_json(pending_path, {})
     run_key = pending.get("run_key") or "manual-" + datetime.now().strftime(
         "%Y-%m-%d")
     date = pending.get("date") or datetime.now().strftime("%Y-%m-%d")
+    # 按号抓取那份：标题里带上号名，两份简报在阅读器里才分得清
+    account = str(pending.get("account") or scope or "").strip()
 
     digest = sha256_text(text)
     runs = Runs()
@@ -189,8 +191,12 @@ def publish(cfg: dict, text: str, title: str | None = None,
             print(f"· 内容没变，跳过（上次已上传：{same.get('id')}）")
             return 0
 
-    default_title = (f"{cfg['publish_title_prefix']} · 语音播报版 · {date}"
-                     if no_ledger else f"{cfg['publish_title_prefix']} · {date}")
+    if no_ledger:
+        default_title = f"{cfg['publish_title_prefix']} · 语音播报版 · {date}"
+    elif account:
+        default_title = f"{cfg['publish_title_prefix']} · {account} · {date}"
+    else:
+        default_title = f"{cfg['publish_title_prefix']} · {date}"
     final_title = title or default_title
     print(f"→ 准备发布：{final_title}")
     print(f"  正文 {len(text)} 字 / {text.count(chr(10)) + 1} 行")

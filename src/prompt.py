@@ -14,7 +14,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from .config import project_path
+from .config import batches_dir, pending_file, project_path
 from .state import save_json
 
 
@@ -106,11 +106,16 @@ def make_batches(articles: list[dict], batch_size: int = 15,
 
 
 def build_pending(inbox: dict, articles: list[dict], run_key: str,
-                  batch_size: int, max_parallel: int) -> dict:
-    """生成待总结包与各批输入文件。articles 需带 index/title/url/source/content。"""
+                  batch_size: int, max_parallel: int,
+                  scope: str = "") -> dict:
+    """生成待总结包与各批输入文件。articles 需带 index/title/url/source/content。
+
+    scope 决定落盘目录：信息流那份仍用 `out/_batches/`，按号抓取那份用
+    `out/_batches-<号名>/`，两批互不覆盖（否则同一天跑两份会串）。
+    """
     prompt = prompt_text()
     batches = make_batches(articles, batch_size, max_parallel)
-    out_dir = project_path("out", "_batches")
+    out_dir = project_path("out", batches_dir(scope))
     out_dir.mkdir(parents=True, exist_ok=True)
     # 清掉上一轮残留，避免合并时串进旧内容
     for old in out_dir.glob("batch-*.json"):
@@ -139,6 +144,8 @@ def build_pending(inbox: dict, articles: list[dict], run_key: str,
         "run_key": run_key,
         "generated_at": _now(),
         "date": inbox["date"],
+        "scope": scope,
+        "account": inbox.get("account", ""),
         "prompt_file": str(project_path("prompts", "summary.md")),
         "prompt": prompt,
         "article_count": len(articles),
@@ -147,7 +154,7 @@ def build_pending(inbox: dict, articles: list[dict], run_key: str,
         "batches": batch_info,
         "articles": articles,
     }
-    p = project_path("out", "pending_summary.json")
+    p = project_path("out", pending_file(scope))
     save_json(p, pending)
     return pending
 
@@ -182,7 +189,9 @@ def merge_batches(pending: dict) -> str:
     problems = []
     if counter[0] == 0:
         problems.append("没找到任何 `## [N. ` 标题行，格式可能不对")
-    if "——" in merged:
+    # 破折号只查正文：标题必须原样照抄，原文标题里带 `——` 是允许的
+    body = "\n".join(l for l in merged.splitlines() if not l.startswith("## "))
+    if "——" in body:
         problems.append("正文里有破折号 `——`，按铁律必须去掉")
     ph = _PLACEHOLDER_RE.search(merged)
     if ph:

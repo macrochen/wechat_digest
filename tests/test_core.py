@@ -117,6 +117,15 @@ class TestMerge(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "占位符"):
                 prompt.merge_batches(p2)
 
+    def test_title_dash_allowed_body_dash_rejected(self):
+        """标题必须原样照抄，原文标题里的 `——` 不能算违规。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._pending(tmp, [
+                "## [1. 《马失前蹄 —— 碳酸锂期权总结》小马白话期权](http://a)\n\n"
+                "正文里没有破折号，只有正常句子。"])
+            out = prompt.merge_batches(p)
+            self.assertIn("—— 碳酸锂期权总结", out)
+
     def test_missing_batch_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = self._pending(tmp, ["## [1. 《甲》号A](http://a)\n\n正文。"])
@@ -206,6 +215,154 @@ class TestLedger(unittest.TestCase):
                 pub.mark("k1", digest, {"id": "cloud_x"})
                 self.assertEqual(pub.same("k1", digest)["id"], "cloud_x")
                 self.assertIsNone(pub.same("k1", state.sha256_text("改过了")))
+
+
+class TestOffered(unittest.TestCase):
+    """投递台账：进过清单就算看过，只有「同一批重扫」才允许再进来一次。"""
+
+    def test_same_run_not_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "offered.json"
+            with mock.patch("src.state.project_path", return_value=target):
+                off = state.Offered()
+                arts = _articles(2)
+                off.mark(arts, "run-A", "2026-11-07")
+                # 同一批链接重扫（run_key 相同）不算重复，允许重建候选池
+                self.assertFalse(off.has(arts[0]["url"], "run-A"))
+                # 换一批新链接（哪怕里面夹着老文章）就当作已看过
+                self.assertTrue(off.has(arts[0]["url"], "run-B"))
+
+    def test_unknown_url_and_times(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "offered.json"
+            with mock.patch("src.state.project_path", return_value=target):
+                off = state.Offered()
+                self.assertFalse(off.has("https://mp.weixin.qq.com/s/none", "run-A"))
+                arts = _articles(1)
+                off.mark(arts, "run-A", "2026-11-07")
+                first = off.data[arts[0]["url"]]["first_at"]
+                off.mark(arts, "run-A", "2026-11-07")
+                rec = state.Offered().data[arts[0]["url"]]
+                self.assertEqual(rec["times"], 2)
+                self.assertEqual(rec["first_at"], first)  # 首次投递时间不被覆盖
+
+    def test_backfill_from_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            inbox = {"date": "2026-11-06", "run_key": "2026-11-06-old",
+                     "articles": _articles(2)}
+            (out / "inbox-2026-11-06.json").write_text(
+                json.dumps(inbox, ensure_ascii=False), encoding="utf-8")
+            (out / "_raw_urls.json").write_text(json.dumps(
+                {"urls": ["https://mp.weixin.qq.com/s/only_url"]}),
+                encoding="utf-8")
+            target = Path(tmp) / "offered.json"
+            with mock.patch("src.state.project_path", return_value=target):
+                off = state.Offered()
+                added, used = off.backfill(out)
+                self.assertEqual(added, 3)
+                self.assertIn("inbox-2026-11-06.json", used)
+                # 补录的老文章对任何新批次都算「看过」
+                self.assertTrue(off.has(_articles(1)[0]["url"], "2026-11-07-new"))
+                self.assertTrue(off.has("https://mp.weixin.qq.com/s/only_url",
+                                        "2026-11-07-new"))
+                # 再次回填不重复计数
+                self.assertEqual(off.backfill(out)[0], 0)
+
+
+class TestScanOfferedFilter(unittest.TestCase):
+    """scan 要真的把「上次投递过但没总结」的文章过滤掉，并自动打开清单页。"""
+
+    def _scan(self, root: Path, urls: list[str]):
+        from src.main import run
+        out = root / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "_raw_urls.json").write_text(
+            json.dumps({"urls": urls}), encoding="utf-8")
+
+        def fake_pp(*parts):
+            return root.joinpath(*parts)
+
+        def fake_meta(url):
+            return {"url": url, "title": f"标题-{url[-6:]}",
+                    "source": "某公众号", "published_at": "2026-11-07 08:00"}
+
+        with mock.patch("src.main.project_path", side_effect=fake_pp), \
+                mock.patch("src.state.project_path", side_effect=fake_pp), \
+                mock.patch("src.main.article.fetch_meta", side_effect=fake_meta), \
+                mock.patch("src.main.blacklist.load", return_value=[]), \
+                mock.patch("src.main._open_listing") as opened:
+            code = run(["scan", "--date", "2026-11-07", "--no-open"])
+        return code, json.loads(
+            (out / "inbox-2026-11-07.json").read_text(encoding="utf-8"))
+
+    def test_offered_filtered_on_next_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = ["https://mp.weixin.qq.com/s/aaa", "https://mp.weixin.qq.com/s/bbb"]
+            code, box = self._scan(root, old)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(box["articles"]), 2)
+            self.assertEqual(box["skipped_offered"], [])
+
+            # 第二批：夹着两篇上次没勾选的旧文 + 一篇新文
+            code, box = self._scan(root, old + ["https://mp.weixin.qq.com/s/ccc"])
+            self.assertEqual(code, 0)
+            self.assertEqual([a["url"] for a in box["articles"]],
+                             ["https://mp.weixin.qq.com/s/ccc"])
+            self.assertEqual(len(box["skipped_offered"]), 2)
+
+    def test_same_batch_rescan_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            urls = ["https://mp.weixin.qq.com/s/aaa"]
+            self._scan(root, urls)
+            _, box = self._scan(root, urls)  # 同一批重扫：修元信息失败用
+            self.assertEqual(len(box["articles"]), 1)
+            self.assertEqual(box["skipped_offered"], [])
+
+    def test_include_offered_opt_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = ["https://mp.weixin.qq.com/s/aaa"]
+            self._scan(root, old)
+            from src.main import run
+
+            def fake_pp(*parts):
+                return root.joinpath(*parts)
+
+            with mock.patch("src.main.project_path", side_effect=fake_pp), \
+                    mock.patch("src.state.project_path", side_effect=fake_pp), \
+                    mock.patch("src.main.article.fetch_meta",
+                               side_effect=lambda u: {"url": u, "title": "t",
+                                                      "source": "s"}), \
+                    mock.patch("src.main.blacklist.load", return_value=[]), \
+                    mock.patch("src.main._open_listing"):
+                run(["scan", "--date", "2026-11-07", "--include-offered",
+                     "--no-open"])
+            box = json.loads((root / "out" / "inbox-2026-11-07.json")
+                             .read_text(encoding="utf-8"))
+            self.assertEqual(len(box["articles"]), 1)
+            self.assertEqual(box["skipped_offered"], [])
+
+
+class TestWechatAppName(unittest.TestCase):
+    """前台 App 名判定要能吃下中英文两种写法。
+
+    微信 CFBundleDisplayName 是 `WeChat`，窗口所有者名却是「微信」，
+    用 `== "微信"` 会永远认为「微信不在前台」。
+    """
+
+    def test_accepts_both_names(self):
+        from src import gui
+        for name in ("微信", "WeChat", "wechat"):
+            self.assertTrue(gui.is_wechat_app(name), name)
+
+    def test_rejects_others_and_empty(self):
+        from src import gui
+        for name in ("loginwindow", "WorkBuddy", "WeChatWork", "", None):
+            self.assertFalse(gui.is_wechat_app(name), name)
 
 
 if __name__ == "__main__":

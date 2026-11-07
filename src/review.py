@@ -14,7 +14,9 @@
   /read 与 /settings 继续可用，不用换端口。
 - 旧模式（显式传 inbox）：启动时固定候选池，收到提交后自动退出，保留兼容。
 
-没有信号，cmd_hydrate 一律拒绝执行；没有超时兜底、没有自动放行。
+没有信号，cmd_hydrate 一律拒绝执行；没有超时兜底、没有静默放行（不会「等太久就自动放行」）。
+自动模式（配置 auto_summary=1 或 `scan --auto-summary`）下，信号由 scan 代写、
+带 `"mode": "auto"` 指纹——不是这里的第二条放行路径，页面也不因此获得任何特权。
 阅读页不写任何文件，也不等于授权总结；在设置页改参数也不等于授权。
 """
 
@@ -29,26 +31,46 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
 from . import archive, blacklist, selection, settings_ui
-from .config import project_path
+from .config import inbox_matches, project_path
 from .state import load_json
 
 
-def current_inbox() -> dict | None:
-    """动态读最新候选池；只有 scan 阶段且没提交过才算「有待确认清单」。
+# 当前服务在看哪一份候选池："" = 信息流那份，否则是按号抓取那份（号名）。
+# 一个常驻服务一次只服务一个 scope（主程序启动时传入），/review 与
+# /api/status 都跟着它走，避免两份简报混在同一个清单页里。
+_ACTIVE_SCOPE = ""
 
-    每次请求都重读，所以 scan 重建候选池后清单自动出现，提交 / hydrate 之后
-    自动收起，全程不需要重启服务，也不会因为服务常驻而重复放行。
+
+def latest_inbox(scope: str | None = None) -> dict | None:
+    """最新候选池（不管有没有提交过）。
+
+    提交后清单会收起，但「这批有没有提交」这个事实还得能被问到，
+    否则 /api/status 会一直报 submitted=false，调用方会以为人没点。
     """
-    files = sorted(project_path("out").glob("inbox-*.json"), reverse=True)
+    scope = _ACTIVE_SCOPE if scope is None else scope
+    files = sorted((p for p in project_path("out").glob("inbox-*.json")
+                    if inbox_matches(p.name, scope)), reverse=True)
     if not files:
         return None
     try:
         box = load_json(files[0], {})
     except (OSError, ValueError):
         return None
-    if not isinstance(box, dict) or box.get("phase") != "scan":
+    if not isinstance(box, dict) or not box.get("articles"):
         return None
-    if not box.get("articles"):
+    if box.get("phase") not in ("scan", "hydrated"):
+        return None
+    return box
+
+
+def current_inbox(scope: str | None = None) -> dict | None:
+    """动态读最新候选池；只有 scan 阶段且没提交过才算「有待确认清单」。
+
+    每次请求都重读，所以 scan 重建候选池后清单自动出现，提交 / hydrate 之后
+    自动收起，全程不需要重启服务，也不会因为服务常驻而重复放行。
+    """
+    box = latest_inbox(scope)
+    if box is None or box.get("phase") != "scan":
         return None
     if selection.read_request(box) is not None:
         return None
@@ -117,6 +139,11 @@ PAGE = r"""<!doctype html>
 <script>
 const DATA = __DATA__;
 const list = document.getElementById('list');
+// 这份清单属于哪个 scope（""=信息流那份，否则是某个号的精选简报）。
+// 保存 / 提交必须带回去，否则常驻服务会当成另一个 scope 处理。
+function query() {
+  return '?scope=' + encodeURIComponent(DATA.scope || '');
+}
 
 DATA.articles.forEach(a => {
   const row = document.createElement('div'); row.className = 'row';
@@ -155,7 +182,8 @@ function msg(text, ok) {
   m.textContent = text; m.className = 'msg ' + (ok ? 'ok' : 'err');
 }
 async function post(path, body) {
-  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+  // 常驻服务按 ?scope= 决定看哪份候选池，提交 / 保存都要把这个参数带回去
+  const r = await fetch(path + query(), {method:'POST', headers:{'Content-Type':'application/json'},
                                body: JSON.stringify(body)});
   const j = await r.json();
   if (!r.ok || !j.ok) throw new Error(j.error || '请求失败');
@@ -239,6 +267,7 @@ NO_REVIEW_PAGE = """<!doctype html>
 __NAV__
 <div class="wrap">
   <h1>选文清单</h1>
+__AUTO__
   <p>当前没有待确认的选文清单：可能本轮已经提交，或者还没跑 scan。</p>
   <p>选文清单、本地阅读、参数设置始终是<b>同一个服务、同一个端口</b>。
      跑完 scan 后刷新本页，清单会自动出现；提交后服务不会关闭，
@@ -249,8 +278,28 @@ __NAV__
 """
 
 
-def build_no_review_page() -> str:
-    return NO_REVIEW_PAGE.replace("__NAV__", nav_html("", False), 1)
+def _auto_notice(scope: str | None = None) -> str:
+    """自动模式「已放行、还没 hydrate」时在清单页补一句说明。
+
+    正常情况下清单在提交后就收起；自动模式本来没人看页面，这里只是让用户
+    自己打开 /review 时不会误以为「扫描没出清单」。
+    """
+    box = latest_inbox(scope)
+    if box is None or box.get("phase") != "scan":
+        return ""
+    req = selection.read_request(box)
+    if not req or req.get("mode") != "auto":
+        return ""
+    at = escape(str(req.get("requested_at") or ""))
+    return ('<p style="color:#b54708;background:#fffaeb;border:1px solid #fedf89;'
+            'border-radius:8px;padding:10px 12px;">⚙ 本轮已按<b>自动模式</b>放行 '
+            f'{int(req.get("selected") or 0)} 篇（{at}，未经人工确认），'
+            '下一步直接跑 <code>hydrate</code>。</p>')
+
+
+def build_no_review_page(scope: str | None = None) -> str:
+    return (NO_REVIEW_PAGE.replace("__NAV__", nav_html("", False), 1)
+            .replace("__AUTO__", _auto_notice(scope), 1))
 
 
 SETTINGS_PAGE = r"""<!doctype html>
@@ -644,6 +693,9 @@ def build_page(inbox: dict) -> str:
         "generated_at": inbox.get("generated_at", ""),
         "phase": inbox.get("phase", ""),
         "run_key": inbox.get("run_key", ""),
+        # 页面上的保存 / 提交请求要带回去，常驻服务靠它区分「信息流那份」
+        # 与「按号抓取那份」——同一个服务可能先后服务过两个 scope。
+        "scope": inbox.get("scope") or "",
         "submitted": selection.read_request(inbox) is not None,
         "articles": articles,
     }
@@ -662,8 +714,20 @@ class _Handler(BaseHTTPRequestHandler):
     def active_inbox(self) -> dict | None:
         """当前可用于选文的候选池；dynamic 模式每次请求重读磁盘。"""
         if self.dynamic:
-            return current_inbox()
+            return current_inbox(self.request_scope())
         return self.inbox if self.has_review else None
+
+    def request_scope(self) -> str:
+        """这次请求要看哪个 scope。
+
+        优先看请求里的 `?scope=`：常驻服务可能先服务信息流那份、后服务
+        按号抓取那份，光靠启动参数（`_ACTIVE_SCOPE`）会看错池子。
+        `?scope=` 为空串表示**明确要信息流那份**（与「没带参数」区分开），
+        没带参数时才退回启动时的 scope。
+        """
+        q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        got = q.get("scope")
+        return (got[0] if got else _ACTIVE_SCOPE) or ""
 
     def log_message(self, fmt, *args):
         pass  # 本地服务，不刷访问日志
@@ -706,20 +770,27 @@ class _Handler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 self._json(500, {"ok": False, "error": str(exc)})
         elif path == "/api/status":
-            if not review_on:
+            scope = self.request_scope()
+            info = box if review_on else latest_inbox(scope)
+            if info is None:
                 self._json(200, {
                     "ok": True, "app": "wechat_digest",
                     "mode": "dynamic" if self.dynamic else "settings",
                     "review": False, "count": 0, "submitted": False,
+                    "scope": scope,
                 })
             else:
+                req = selection.read_request(info)
                 self._json(200, {
                     "ok": True, "app": "wechat_digest",
-                    "mode": "review", "review": True,
-                    "date": box["date"],
-                    "phase": box.get("phase"),
-                    "count": len(box["articles"]),
-                    "submitted": selection.read_request(box) is not None,
+                    "mode": "review" if review_on else "dynamic",
+                    "review": review_on,
+                    "date": info["date"],
+                    "scope": info.get("scope") or scope,
+                    "phase": info.get("phase"),
+                    "count": len(info["articles"]),
+                    "submitted": req is not None,
+                    "request_mode": (req or {}).get("mode"),
                 })
         elif path in ("/", "/review"):
             if review_on:
@@ -728,7 +799,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, build_settings_page(False),
                            "text/html; charset=utf-8")
             elif self.dynamic:
-                self._send(200, build_no_review_page(),
+                self._send(200, build_no_review_page(self.request_scope()),
                            "text/html; charset=utf-8")
             else:
                 self._json(404, {"ok": False, "error": "当前没有候选池清单"})
@@ -841,9 +912,19 @@ class _Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_stop, daemon=True).start()
 
 
+def review_url(base: str, scope: str = "") -> str:
+    """清单页地址。**总是带 `?scope=`**（空 scope 也要带），
+
+    因为常驻服务靠这个参数决定读哪份候选池：`?scope=` 空串 = 信息流那份，
+    不带参数 = 沿用服务启动时的 scope。两份简报同一天都在时，
+    少一个参数就会打开错的那份。
+    """
+    return f"{base}/review?scope={quote(scope or '')}"
+
+
 def serve(inbox: dict | None, port: int = 7777,
           open_browser: bool = True, *, dynamic: bool = False,
-          landing: str | None = None) -> dict:
+          landing: str | None = None, scope: str = "") -> dict:
     """起本地服务。
 
     dynamic=True（CLI 默认）：常驻模式，候选池每次请求动态读取，
@@ -871,10 +952,12 @@ def serve(inbox: dict | None, port: int = 7777,
             f"端口 {port} 起不来：{exc}；换个端口加 --port <端口>") from exc
 
     base = f"http://127.0.0.1:{port}"
+    global _ACTIVE_SCOPE
+    _ACTIVE_SCOPE = scope or ""
     box = current_inbox() if dynamic else None
     landing = landing or ("review" if has_review else "settings")
-    url = base + ("/review" if landing == "review" and
-                  (has_review or box is not None) else "/settings")
+    url = (review_url(base, _ACTIVE_SCOPE) if landing == "review" and
+           (has_review or box is not None) else f"{base}/settings")
     print(f"→ 本地控制台：{base}", flush=True)
     if dynamic:
         if box is not None:

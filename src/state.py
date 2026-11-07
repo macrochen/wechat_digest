@@ -63,6 +63,100 @@ class Seen:
         save_json(self.path, self.data)
 
 
+# ---------------------------------------------------------------- 投递台账
+
+class Offered:
+    """候选池投递台账：进过清单就算「用户已经看过一遍」。
+
+    `seen.json` 只在总结推送成功后才写，管不住另一类情况——上次抓了、
+    进了清单、但用户没勾选的文章。它们没被总结，下次抓取时会原样又出现在
+    清单里，等于让用户把同一批文章反复看几遍。
+
+    这里按 url 记住「进过清单」，下次 scan 直接过滤掉：
+      · 记录的 run_key 和本次相同 → 是同一批链接重扫（修失败 / 补元信息），
+        不算重复投递，允许重建候选池；
+      · run_key 不同 → 新抓的一批，哪怕其中几条是老文章，也当已看过过滤。
+    用 `scan --include-offered` 可以临时无视这份台账。
+    """
+
+    def __init__(self):
+        ensure_dirs()
+        self.path = project_path("state", "offered.json")
+        self.data = load_json(self.path, {})
+
+    def has(self, url: str, run_key: str) -> bool:
+        rec = self.data.get(url) or {}
+        return bool(rec) and rec.get("run_key") != run_key
+
+    def mark(self, articles: list[dict], run_key: str, date: str) -> None:
+        for a in articles:
+            rec = self.data.get(a["url"]) or {}
+            self.data[a["url"]] = {
+                "title": a.get("title", ""),
+                "source": a.get("source", ""),
+                "first_at": rec.get("first_at") or _now(),
+                "last_at": _now(),
+                "times": int(rec.get("times") or 0) + 1,
+                "run_key": run_key,
+                "date": date,
+            }
+        save_json(self.path, self.data)
+
+    def stats(self) -> dict:
+        return {
+            "total": len(self.data),
+            "sources": sorted({r.get("source", "") for r in self.data.values()
+                               if r.get("source")}),
+        }
+
+    def backfill(self, out_dir: Path) -> tuple[int, list[str]]:
+        """从历史候选池与抓取链接补录「已投递」，只补 URL 不补正文。
+
+        早期版本没写这份台账，但 `out/inbox-*.json` 与 `out/_raw_urls*.json`
+        还留着当时抓过的链接，可以据此补记，避免老文章下次又进清单。
+        返回 (新增条数, 读过的文件名)。
+        """
+        added, used = 0, []
+        candidates: list[tuple[str, str, str, str]] = []  # url,title,source,run_key
+        for f in sorted(out_dir.glob("inbox-*.json")):
+            box = load_json(f, {})
+            if not isinstance(box, dict):
+                continue
+            used.append(f.name)
+            rk = box.get("run_key") or f"backfill:{f.name}"
+            for a in box.get("articles") or []:
+                if isinstance(a, dict) and a.get("url"):
+                    candidates.append((a["url"], a.get("title", ""),
+                                       a.get("source", ""), rk))
+        for f in sorted(out_dir.glob("_raw_urls*.json")):
+            raw = load_json(f, {})
+            urls = raw.get("urls") if isinstance(raw, dict) else raw
+            if isinstance(raw, dict) and not isinstance(urls, list):
+                # 抓取中断时写的是 {"obtained": [...]}，同样算抓过
+                urls = raw.get("obtained")
+            if not isinstance(urls, list):
+                continue
+            used.append(f.name)
+            for u in urls:
+                if isinstance(u, str) and u:
+                    candidates.append((u, "", "", f"backfill:{f.name}"))
+        for url, title, source, rk in candidates:
+            rec = self.data.get(url)
+            if rec:  # 已有记录就保留首次投递的那份，不覆盖
+                rec.setdefault("title", title)
+                rec.setdefault("source", source)
+                continue
+            self.data[url] = {
+                "title": title, "source": source,
+                "first_at": _now(), "last_at": _now(), "times": 1,
+                "run_key": rk, "date": "", "backfilled": True,
+            }
+            added += 1
+        if added:
+            save_json(self.path, self.data)
+        return added, used
+
+
 # ---------------------------------------------------------------- 第 2 层：正文相似度
 
 def shingles(text: str, n: int = 5) -> set[str]:
