@@ -153,7 +153,10 @@ def fetch_meta(url: str) -> dict:
     """只取标题 / 公众号名 / 发布时间，不返回正文。"""
     page = fetch_html(url)
     title = _match([
-        r'var\s+msg_title\s*=\s*["\'](.*?)["\']\s*;',
+        # 微信页面里是 var msg_title = '标题'.html(false); 后面不是分号，
+        # 旧正则会一路吞到下一个引号，把 msg_desc / msg_cdn_url 混进标题。
+        # 用 [^"']+ 禁止跨引号，就能只取标题本身。
+        r'var\s+msg_title\s*=\s*["\']([^"\']+)["\']',
         r'"msg_title"\s*:\s*"([^"]+)"',
         r'<h1[^>]*rich_media_title[^>]*>(.*?)</h1>',
         r'<meta\s+property="og:title"\s+content="([^"]+)"',

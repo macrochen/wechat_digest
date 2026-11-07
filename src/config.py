@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 """路径与运行配置。
 
-所有可调项集中在 config/settings.json。注意：令牌**不在**这里，
-运行时才从项目内独立的 config/secrets.local.json 只读加载。
+优先级：DEFAULTS < config/settings.json（项目定稿） <
+config/settings.local.json（参数设置页写的用户覆盖层，Git 已忽略）。
+令牌**不在**这些文件里，运行时才从项目内独立的 config/secrets.local.json
+只读加载。每次 CLI 命令都重新读盘，所以设置页保存即生效、无需重启服务。
 """
 
 from __future__ import annotations
@@ -37,11 +39,19 @@ DEFAULTS = {
         "logical_height": 832,
         "more_button": [1258, 101],
         "copy_link": [1110, 300],
-        "close_window": [88, 108],
+        "close_window": [76, 108],
         "open_wait": 2.5,
         "menu_wait": 0.8,
-        "close_wait": 1.0,
+        "close_wait": 1.8,
         "click_wait": 0.45,
+        # 点击前标题行校准：卡片第一行是浅灰公众号名（点到会打开主页），
+        # 第二行才是深色加粗标题。每次点击前重截图，把 y 吸附到标题行。
+        # 1=开启 / 0=关闭；搜索半径是逻辑像素，阈值是 RGB 上限。
+        "title_probe": 1,
+        "title_search_down": 45,
+        "title_search_up": 20,
+        "title_dark_threshold": 120,
+        "title_min_dark": 10,
     },
 }
 
@@ -57,14 +67,19 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_settings() -> dict:
-    """读配置；文件缺失时用默认值。"""
-    path = ROOT / "config" / "settings.json"
+    """读配置；主配置缺失用默认值，用户覆盖层缺失则跳过。"""
     cfg = dict(DEFAULTS)
-    if path.exists():
+    for name in ("settings.json", "settings.local.json"):
+        path = ROOT / "config" / name
+        if not path.exists():
+            continue
         try:
-            cfg = _deep_merge(cfg, json.loads(path.read_text(encoding="utf-8")))
+            override = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise SystemExit(f"× 配置文件读不了：{path}（{exc}）")
+        if not isinstance(override, dict):
+            raise SystemExit(f"× 配置文件格式不对，应为 JSON 对象：{path}")
+        cfg = _deep_merge(cfg, override)
     tf = Path(cfg["token_file"]).expanduser()
     cfg["token_file"] = str(tf if tf.is_absolute() else ROOT / tf)
     return cfg

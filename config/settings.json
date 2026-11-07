@@ -13,10 +13,10 @@
     "logical_height": 832,
     "more_button": [1258, 101],
     "copy_link": [1110, 300],
-    "close_window": [88, 108],
+    "close_window": [76, 108],
     "open_wait": 2.5,
     "menu_wait": 0.8,
-    "close_wait": 1.0,
+    "close_wait": 1.8,
     "click_wait": 0.45
   }
 }

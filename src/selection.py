@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """人工选文清单。
 
-对齐参考项目的选文铁律：人没筛过 = 整份都要；清单过期（候选池被重扫
-覆盖）自动忽略并打印提示，不当报错，更不静默丢篇。
+对齐参考项目的选文铁律：人没在清单页提交 = 不总结。
+选文清单决定「总结哪几篇」，提交信号决定「什么时候可以开始」，两者分工，
+都按 inbox_generated_at 判过期（候选池被重扫覆盖后自动作废）。
 """
 
 from __future__ import annotations
@@ -39,15 +40,47 @@ def write_plan(inbox: dict, indices: list[int] | None,
 
 
 def read_plan(inbox: dict):
-    """返回选中的 index 列表；None = 没筛过/清单过期，整份都要。"""
+    """返回选中的 index 列表；None = 没清单/清单过期，调用方必须拒绝放行。"""
     p = plan_path(inbox["date"])
     if not p.exists():
         return None
     plan = load_json(p, {})
     if plan.get("inbox_generated_at") != inbox.get("generated_at"):
-        print("· 选文清单已过期（候选池被重扫覆盖），自动忽略，整份都要", flush=True)
+        print("· 选文清单已过期（候选池被重扫覆盖），请在清单页重新勾选并提交",
+              flush=True)
         return None
     selected = plan.get("selected")
     if not isinstance(selected, list):
         return None
     return selected
+
+
+def request_path(date: str) -> Path:
+    return project_path("out", "_plan", f"summary-request-{date}.json")
+
+
+def write_request(inbox: dict, selected_count: int) -> dict:
+    """人工在清单页点「开始总结」才写；这是唯一的放行信号。"""
+    doc = {
+        "date": inbox["date"],
+        "inbox_generated_at": inbox["generated_at"],
+        "run_key": inbox.get("run_key"),
+        "requested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "selected": selected_count,
+        "_note": "没有这个文件，hydrate 一律拒绝执行；正文一个字都不放这里",
+    }
+    save_json(request_path(inbox["date"]), doc)
+    return doc
+
+
+def read_request(inbox: dict) -> dict | None:
+    """返回提交信号；None = 没提交 / 信号过期，调用方必须拒绝放行。"""
+    p = request_path(inbox["date"])
+    if not p.exists():
+        return None
+    req = load_json(p, {})
+    if req.get("inbox_generated_at") != inbox.get("generated_at"):
+        print("· 提交信号已过期（候选池被重扫覆盖），请在清单页重新提交",
+              flush=True)
+        return None
+    return req
