@@ -8,15 +8,19 @@
 复制链接 → Cmd+W 关窗」。到了公众号会话页，界面完全是另一回事，2026-11-08
 在这台机器上实测到的关键差异：
 
-1. **文章不开浮窗**，而是在主窗口里多一个**标签页**。所以 `article_window_open`
-   恒为假，`grab._open_and_copy` 那套「点完验证浮窗真的开了」的判据在这里
-   全部失效，Cmd+W 更是绝对不能用（会关掉微信主窗口，2026-11-07 已踩过）。
-2. 标签页右端那个「…」**不能点**：菜单在鼠标按下时就弹出、松开正好落在第一项，
-   实测一点就把标签关了（试了两次都一样）。所以这里绕开它。
-3. 标签页右端还有一个**地球图标 = 「在浏览器打开」**：点它，文章在默认浏览器
-   里打开，微信这边**自动关掉标签、回到公众号页**。于是拿 URL 变成：
-   浏览器地址栏 Cmd+L → Cmd+C → 读剪贴板。既准确（拿到的是完整 URL，不靠
-   截图猜），又完全不用碰 Cmd+W。
+1. **文章不开浮窗**，而是主窗口里的**标签页**（也会以独立浮窗出现，两种形态
+   都实测过）。所以 `article_window_open` 恒为假，`grab._open_and_copy` 那套
+   「点完验证浮窗真的开了」的判据在这里全部失效。
+2. 标签栏右上角那组按钮的**位置和数量都不固定**（2026-11-08 用户指出、当天实测
+   确认）：全屏标签页形态下工具栏在 y≈48，独立浮窗形态下在 y≈187；按钮从右到左
+   依次是「⋯」「地球」「🔍」，但**有时没有地球**。早先写死 (1218,48)，那个点
+   恰好是全屏形态下的**地球**（=「使用默认浏览器打开」），于是每篇都把文章甩到
+   浏览器里去了。现在的做法见 `_toolbar_row()` / `_more_button()`：按窗口几何
+   算工具栏行，再在这一行上找最右的图标簇。
+3. 取 URL 走「⋯ 菜单 → 复制链接」：菜单里有「转发给朋友 / 分享到朋友圈 / 收藏 /
+   使用默认浏览器打开 / 添加浮窗 / 复制链接」，点「复制链接」直接把 URL 写进剪贴板。
+   **全程不开浏览器、不按 Cmd+W**（Cmd+W 在这个外壳里实测无效）。菜单项位置也用
+   OCR 找文字，不写死 y。
 4. 右栏是聊天式时间线：每次推送上面有一行时间（「昨天 08:31」「星期三 07:31」），
    下面是这次推送的卡片；**卡片里第一张（带封面图的那条）才是头条**，同一次
    推送的其余几条不要——这就是用户说的「一天发了多篇，我只需要取第一篇」。
@@ -24,9 +28,12 @@
 
 分工
 ----
-* OCR（`ocr.py`）只负责**认字**：左栏的号名、右栏的时间行、标题文字。
-* 点哪里仍然由**像素判据**决定（`feed_vision.find_title_bands` 找加粗标题带），
-  OCR 认错字也不会让点击落到别处。
+* OCR（`ocr.py`）负责**认字与菜单项**：左栏号名、右栏时间行与标题文字、
+  「⋯」菜单里的「复制链接」。
+* **点击坐标以像素判据为主**：头条用 OCR 行的几何（x/y/字高）筛、标签栏按钮
+  用「窗口几何 + 暗像素聚簇」算；右栏封面图/缩略图会和标题粘成超高像素带，
+  所以这里**不用** `feed_vision.find_title_bands`（那是信息流卡片的判据）。
+  OCR 认错字最多让标题写歪，不会让点击落到别处。
 * 认不出、对不上、切不过去，一律 `GrabAborted`（退出码 3）停轮等人，
   绝不猜、不盲点、不挪坐标重试。
 """
@@ -41,7 +48,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from . import feed_vision, gui, nav, ocr
+from . import feed_vision, gui, nav, ocr, winpos
 from .config import project_path
 
 _SHOT = Path("/tmp/wd_acct.png")
@@ -350,7 +357,15 @@ def headlines(cfg: dict, texts: list[ocr.Text] | None = None,
 
     「像标题」的判据（都从实测里来）：
       * x 落在正文列（≥760），右端缩略图里的字被排除；
+      * **左边界必须对齐标题列**（x ≤ 870）：右栏卡片的标题一律左对齐在
+        x≈778~790；卡片右上角的「• clash：美国」这类位置标签 OCR 会读成
+        x≈1145~1202 的一行字（h 也在 12~24 之间），只按「x ≥ 760」拦不住，
+        点上去当然打不开文章；
       * 高 12~30px：正文摘要和图片里的小字（实测 h=10）被排除；
+      * **组内优先取高 12~24px 的行**：大图推送的封面**宣传语**会被 OCR 读成
+        28~36px 的大字（实测「指数盈利预测，」h=36.1 /「独家免费开放」h=28.8），
+        它比真标题更靠上，只按 12~30 过滤会把封面语当成头条、点上去等于点图片。
+        整组都没有标题字号的行时才退回宽松池（30px）。
       * 在时间线下方 6px 以外、400px 以内。
     """
     ui = cfg["ui"]
@@ -358,12 +373,16 @@ def headlines(cfg: dict, texts: list[ocr.Text] | None = None,
     texts = texts if texts is not None else _texts(cfg, path)
     footer = float(ui["account_footer_y"])
     tx0, tx1 = ui["account_title_x"]
+    x_left_max = float(ui.get("account_title_left_max", 870))
+    h_tight = float(ui.get("account_title_max_h", 24))
+    h_hard = float(ui.get("account_title_hard_max", 30))
     stamps = [t for t in texts
               if _TS_RE.match((t.text or "").strip())
               and 840 <= t.cx <= 1120 and 60 <= t.cy < footer]
     stamps.sort(key=lambda t: t.y)
     lines = [t for t in texts
-             if tx0 - 8 <= t.x <= tx1 and 12 <= t.h <= 30
+             if tx0 - 8 <= t.x <= min(x_left_max, tx1)
+             and 12 <= t.h <= h_hard
              and 60 <= t.cy < footer]
     out: list[Headline] = []
     for i, st in enumerate(stamps):
@@ -372,7 +391,8 @@ def headlines(cfg: dict, texts: list[ocr.Text] | None = None,
         cand = [t for t in lines if lo < t.cy < hi and t.cy - st.cy < 400]
         if not cand:
             continue
-        line = min(cand, key=lambda t: t.y)            # 组内第一条 = 头条
+        tight = [t for t in cand if t.h <= h_tight]
+        line = min(tight or cand, key=lambda t: t.y)    # 组内第一条 = 头条
         out.append(Headline(title=line.text,
                             x=line.x + min(line.w / 2, 80),
                             y=line.cy,
@@ -383,34 +403,250 @@ def headlines(cfg: dict, texts: list[ocr.Text] | None = None,
 
 # ---------------------------------------------------------------- 取链接
 
-def _is_article_page(cfg: dict, texts: list[ocr.Text] | None = None) -> bool:
+def _is_article_page(cfg: dict, texts: list[ocr.Text] | None = None,
+                     image_path: str | Path | None = None) -> bool:
     """点文章后，界面是不是变成「主窗口内的文章标签页」了。
 
-    判据：右栏顶部那个号名不见了（列表模式的标志），文章页的标签栏文字
-    在 x<500，不会冒充号名。
+    判据：**左栏消失**（`nav.left_pane_present()` 为假）。列表模式的左栏
+    是一整列公众号，点开文章后整页变成阅读区，那条竖带不再存在。
+
+    不能用「右栏顶部号名不见了」（早先的写法）：文章页顶部的 Chromium
+    **标签栏**文字正好落在号名那个 y 区间（实测读到「E 华泰柏瑞的 ETF
+    skill，非常强× Q」），于是文章明明打开了也判成没打开、再点一次。
+    `texts` 参数保留只为兼容旧调用，判据已不再看 OCR。
     """
-    return _pane_header(cfg, texts) is None
+    return not nav.left_pane_present(cfg, image_path)
 
 
-def _browser_front(cfg: dict, timeout: float) -> str | None:
-    """等到默认浏览器起来（点「地球」之后）。"""
-    names = [str(n).casefold() for n in cfg["ui"].get("account_browsers", [])]
-    deadline = time.time() + float(timeout)
-    while time.time() < deadline:
-        app = gui.frontmost_app()
-        if app and any(n in app.casefold() for n in names):
-            return app
-        _sleep(0.4)
+def _wechat_window(cfg: dict) -> dict | None:
+    """面积最大的微信 layer0 窗口（= 当前的文章窗口）。
+
+    文章在**两种形态**下打开过（2026-11-08 实测两次，切换原因未完全确定）：
+      * 主窗口内的标签页：窗口就是全屏 (0,29) 1280x803，工具栏 y≈48；
+      * 独立浮窗：(11,158) 1206x569，工具栏 y≈187。
+
+    所以工具栏位置只能按窗口几何现算。早先写死 (1218,48)：在全屏形态下
+    那一点是**地球**，在浮窗形态下连工具栏都不在 —— 两种都会点错。
+    """
+    ws = winpos.windows() or []
+    cand = [w for w in ws
+            if ("微信" in str(w.get("owner")) or "eChat" in str(w.get("owner")))
+            and w.get("layer") == 0 and w["w"] > 300 and w["h"] > 200]
+    return max(cand, key=lambda w: w["w"] * w["h"]) if cand else None
+
+
+def _toolbar_row(shot: str | Path, win: dict) -> float:
+    """文章工具栏的中心 y：窗口顶部 90px 内右侧 30% 处暗像素最多的一行。
+
+    工具栏上有一排图标（× 🔍 🌐 ⋯），暗像素比标题栏空白区多一个量级。
+    实测全屏形态得 y=48、浮窗形态得 y=187，与肉眼读数一致。
+    """
+    img = feed_vision.decode_png(shot)
+    sx, sy = img.w / 1280.0, img.h / 832.0
+    x_lo = int((win["x"] + win["w"] * 0.70) * sx)
+    x_hi = min(int((win["x"] + win["w"]) * sx), img.w)
+    best_y, best_n = win["y"] + 19, 0
+    for y in range(int(win["y"] * sy),
+                   min(int((win["y"] + 90) * sy), img.h)):
+        row = img.rows[y]
+        n = 0
+        for x in range(x_lo, x_hi):
+            i = x * img.ch
+            if min(row[i], row[i + 1], row[i + 2]) < 160:
+                n += 1
+        if n > best_n:
+            best_y, best_n = y, n
+    return best_y / sy
+
+
+def _more_button(shot: str | Path, win: dict, y: float) -> tuple[float, float] | None:
+    """工具栏最右那个「⋯」按钮的中心（逻辑坐标）。
+
+    取工具栏上下各 8px 的一条带，按列统计暗像素并聚簇，**从右往左**取
+    第一个宽度 5~42px 的簇。宽度门限用来跳过窗口右边缘/滚动条这种细长噪声；
+    只要最右那个图标，就不必判断旁边有没有地球（两个版本都满足「⋯ 在最右」）。
+    """
+    img = feed_vision.decode_png(shot)
+    sx, sy = img.w / 1280.0, img.h / 832.0
+    x_lo = int((win["x"] + win["w"] * 0.55) * sx)
+    x_hi = min(int((win["x"] + win["w"] - 6) * sx), img.w)
+    prof: dict[int, int] = {}
+    for yy in range(int((y - 8) * sy), int((y + 8) * sy)):
+        if yy < 0 or yy >= img.h:
+            continue
+        row = img.rows[yy]
+        for x in range(max(0, x_lo), x_hi):
+            i = x * img.ch
+            if min(row[i], row[i + 1], row[i + 2]) < 160:
+                prof[x] = prof.get(x, 0) + 1
+    if not prof:
+        return None
+    cols = sorted(prof)
+    clusters: list[list[int]] = [[cols[0]]]
+    for c in cols[1:]:
+        if c - clusters[-1][-1] > 5:
+            clusters.append([c])
+        else:
+            clusters[-1].append(c)
+    for cl in reversed(clusters):
+        if 5 <= (cl[-1] - cl[0]) / sx <= 42:
+            return (((cl[0] + cl[-1]) / 2) / sx, y)
     return None
+
+
+def _copy_link_via_menu(cfg: dict, *, verbose: bool = True) -> str:
+    """⋯ → 「复制链接」→ 读剪贴板。
+
+    为什么不点旁边那个地球：地球 = 「使用默认浏览器打开」，会把文章甩到
+    浏览器里（用户 2026-11-08 明确反馈不要这样）。「⋯」菜单里有「复制链接」，
+    只在本地写剪贴板，微信这边也不关标签。
+    菜单项位置同样靠 OCR 找文字，不写死 y：菜单项会随版本增删。
+    """
+    ui = cfg["ui"]
+    win = _wechat_window(cfg)
+    if win is None:
+        raise _fail("CGWindowList 里找不到微信的大窗口，无法定位标签栏按钮。")
+    shot = gui.screenshot(_SHOT)
+    row = _toolbar_row(shot, win)
+    btn = _more_button(shot, win, row)
+    if btn is None:
+        raise _fail(
+            "在标签栏第 "
+            f"{row:.0f} 行上没找到「⋯」按钮（窗口 "
+            f"{win['x']:.0f},{win['y']:.0f} {win['w']:.0f}x{win['h']:.0f}）。\n"
+            f"  现场截图：{shot}\n"
+            "  多半是文章还没加载完，或这个版本工具栏布局又变了。"
+            "请跑 `account --probe` 看一眼这一屏。")
+    if verbose:
+        print(f"  · 打开「⋯」菜单（{btn[0]:.0f},{btn[1]:.0f}，"
+              f"标签栏第 {row:.0f} 行）", flush=True)
+    gui.click(btn[0], btn[1])
+    _sleep(ui.get("account_menu_wait", 1.0))
+
+    shot2 = gui.screenshot(_SHOT)
+    texts = ocr.recognize(shot2, logical_width=ui["logical_width"],
+                          logical_height=ui["logical_height"])
+    item = next((t for t in texts if "复制链接" in (t.text or "")), None)
+    if item is None:
+        gui.press_escape()
+        _sleep(0.3)
+        seen = "、".join(t.text for t in sorted(
+            [t for t in texts if t.x >= win["x"] + win["w"] * 0.6],
+            key=lambda t: t.cy)[:8])
+        raise _fail(
+            "「⋯」菜单里没找到「复制链接」。\n"
+            f"  这一屏读到的菜单文字：{seen or '（一个都没读到）'}\n"
+            f"  现场截图：{shot2}")
+    if verbose:
+        print(f"  · 点「复制链接」（{item.cx:.0f},{item.cy:.0f}）", flush=True)
+    gui.clipboard_clear()
+    _sleep(0.3)
+    gui.click(item.cx, item.cy)
+    _sleep(ui.get("account_copy_wait", 0.8))
+    raw = gui.clipboard_read() or ""
+    m = _URL_RE.search(raw)
+    if not m:
+        raise _fail(
+            "点了「复制链接」，但剪贴板里没有公众号链接。\n"
+            f"  剪贴板内容：{raw[:60]!r}")
+    return m.group(0)
+
+
+def _close_button(shot: str | Path, win: dict, y: float) -> tuple[float, float] | None:
+    """标签栏上**当前标签**的「×」中心（逻辑坐标）。
+
+    不能用 OCR 定位：Vision 把整个标签连同 × 和放大镜读成**一行**
+    （实测「= 华泰柏瑞的 ETF skill，非常强× Q」，bbox x=100..338），
+    「×」既不是独立行，bbox 中心也落在标题文字中间；早先还把候选限制在
+    窗口右半边 x≥640，而标签栏在**左侧**，于是必然找不到。
+
+    纯像素（实测这一屏的列聚簇，逻辑坐标）：
+
+    ======  ==================================  ==========
+    簇       x 范围                             含义
+    ======  ==================================  ==========
+    65..76   12px / 42                         后退/前进箭头
+    99..114  16px / 173                        标签 favicon
+    123..268 若干个 20~57px 的宽簇             标签标题文字
+    **291..298  8px / 22**                     **×（要点的）**
+    325..336 12px / 48                         放大镜（搜索标签）
+    ======  ==================================  ==========
+
+    规则：在工具栏行 y±10 的带里按列统计暗像素、聚簇，取宽 5~16px 的
+    「细簇」（标题文字都是 ≥20px 的宽簇），排除 x<90 的导航箭头；
+    **倒数第二个细簇就是 ×**（最后一个是放大镜）。这样标题长短、
+    有没有地球图标都不影响定位。
+    """
+    img = feed_vision.decode_png(shot)
+    sx, sy = img.w / 1280.0, img.h / 832.0
+    x_lo = int((win["x"] + 55) * sx)
+    x_hi = min(int((win["x"] + 520) * sx), img.w)
+    prof: dict[int, int] = {}
+    for yy in range(int((y - 10) * sy), int((y + 10) * sy)):
+        if yy < 0 or yy >= img.h:
+            continue
+        row = img.rows[yy]
+        for x in range(max(0, x_lo), x_hi):
+            i = x * img.ch
+            if min(row[i], row[i + 1], row[i + 2]) < 170:
+                prof[x] = prof.get(x, 0) + 1
+    if not prof:
+        return None
+    cols = sorted(prof)
+    clusters: list[list[int]] = [[cols[0]]]
+    for c in cols[1:]:
+        if c - clusters[-1][-1] > 3:
+            clusters.append([c])
+        else:
+            clusters[-1].append(c)
+    thin = []
+    for cl in clusters:
+        x0, x1 = cl[0] / sx, cl[-1] / sx
+        total = sum(prof[i] for i in cl)
+        if 5 <= x1 - x0 + 1 <= 16 and total <= 90 and x0 >= win["x"] + 90:
+            thin.append((x0, x1))
+    if not thin:
+        return None
+    target = thin[-2] if len(thin) >= 2 else thin[-1]
+    return ((target[0] + target[1]) / 2, y)
+
+
+def _close_article(cfg: dict, *, verbose: bool = True) -> None:
+    """关掉当前文章标签，回到公众号列表模式。
+
+    × 的位置随标签标题长短变化，用 `_close_button()` 现算，不写死坐标。
+    **不用 Cmd+W** —— 在这个 Chromium 外壳里实测按了没有任何反应。
+    """
+    ui = cfg["ui"]
+    win = _wechat_window(cfg)
+    if win is None:
+        raise _fail("找不到微信窗口，无法关闭文章标签。")
+    shot = gui.screenshot(_SHOT)
+    row = _toolbar_row(shot, win)
+    btn = _close_button(shot, win, row)
+    if btn is None:
+        raise _fail(
+            "标签栏上没定位到「×」，不知道点哪里关文章。\n"
+            f"  现场截图：{shot}（工具栏第 {row:.0f} 行）\n"
+            "  请手工关掉这个文章标签后重跑。")
+    if verbose:
+        print(f"  · 关闭文章标签（{btn[0]:.0f},{btn[1]:.0f}）", flush=True)
+    gui.click(btn[0], btn[1])
+    _sleep(ui.get("account_close_wait", 1.4))
+    state = nav.page_state(cfg)
+    if _is_article_page(cfg) or state["mode"] != "list":
+        raise _fail(
+            "点了「×」之后没回到公众号列表模式"
+            f"（识别为 {state['mode']}）。\n"
+            f"  现场截图：{state['image']}\n"
+            "  请手工切回列表模式后重跑。")
 
 
 def grab_headline(cfg: dict, hl: Headline, *, verbose: bool = True,
                   tries: int = 2) -> str:
-    """取一篇头条的链接：点标题 → 地球（在浏览器打开）→ 浏览器读地址栏。
+    """取一篇头条的链接：点标题 → 「⋯」菜单 → 「复制链接」→ 关标签。
 
-    **全程不按 Cmd+W**：微信这边是「地球」自己把标签关掉、回到公众号页，
-    浏览器那边 Cmd+W 只关它自己的标签页。这样彻底避开「在微信主窗口按
-    Cmd+W 会把微信关掉」那个坑。
+    **不开浏览器、不按 Cmd+W**。标签栏按钮按窗口几何现算，不再写死坐标。
     """
     ui = cfg["ui"]
     opened = False
@@ -430,55 +666,27 @@ def grab_headline(cfg: dict, hl: Headline, *, verbose: bool = True,
             "  多半是这行文字已经不是标题（列表滚动了 / 版面变了）。"
             "请手工点一次确认后重跑。")
 
-    gx, gy = ui["account_tab_globe"]
-    if verbose:
-        print(f"  · 在浏览器打开（点地球 {gx:.0f},{gy:.0f}）", flush=True)
-    gui.click(gx, gy)
-    app = _browser_front(cfg, ui.get("account_browser_wait", 6.0))
-    if app is None:
-        raise _fail(
-            "点了标签页右端的「在浏览器打开」，但没有浏览器接管前台。\n"
-            f"  当前前台是「{gui.frontmost_app() or '未知'}」。\n"
-            "  请确认系统默认浏览器可用；也可以手工点一次那个地球图标看看。")
-
-    gui.clipboard_clear()
-    _sleep(0.35)
-    gui.cmd_key(37)              # Cmd+L 聚焦地址栏
-    _sleep(0.30)
-    gui.cmd_key(8)               # Cmd+C 复制地址
-    _sleep(0.50)
-    raw = gui.clipboard_read()
-    m = _URL_RE.search(raw or "")
-    if not m:
-        gui.cmd_key(13)          # 关掉这个浏览器标签，别留垃圾
-        _sleep(0.4)
-        gui.activate_wechat(1.2)
-        raise _fail(
-            "浏览器地址栏里没读到公众号链接"
-            f"（剪贴板：{(raw or '')[:60]!r}）。\n"
-            "  可能是地址栏没聚焦（浏览器是别的界面），或文章页还没加载完。")
-
-    url = m.group(0)
-    gui.cmd_key(13)              # 关掉浏览器标签（只影响浏览器）
-    _sleep(0.5)
-    gui.activate_wechat(1.4)     # 回微信：地球已把标签关掉，应该停在公众号页
-    state = nav.page_state(cfg)
-    if state["mode"] != "list":
-        raise _fail(
-            "取完链接回到微信后，界面不在公众号列表模式"
-            f"（识别为 {state['mode']}）。\n"
-            f"  现场截图：{state['image']}\n"
-            "  请手工切回列表模式再重跑。")
+    url = _copy_link_via_menu(cfg, verbose=verbose)
+    _close_article(cfg, verbose=verbose)
     return url
 
 
 # ---------------------------------------------------------------- 主流程
 
-def _write_urls(cfg: dict, name: str, urls: list[str]) -> Path:
+def _write_urls(cfg: dict, name: str, urls: list[str],
+                *, partial: bool = False) -> Path:
+    """写本轮结果。**失败留底走 partial，绝不覆盖上一次成功的整份文件**。
+
+    `scan --urls-file` 只认 `_raw_urls-<号名>.json`；partial 是给人看的
+    现场证据，不进正式链路，所以单独一个文件名。
+    """
     import json
-    out = project_path("out", f"_raw_urls-{slug(name)}.json")
+    stem = (f"_raw_urls_partial-{slug(name)}.json" if partial
+            else f"_raw_urls-{slug(name)}.json")
+    out = project_path("out", stem)
     payload = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-               "account": name, "count": len(urls), "urls": urls}
+               "account": name, "count": len(urls), "urls": urls,
+               "partial": partial}
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                    encoding="utf-8")
@@ -496,7 +704,7 @@ def grab_account(cfg: dict, name: str, limit: int, *, verbose: bool = True,
     if dry_run:
         return {"dry_run": True, "account": name, "limit": limit,
                 "would": "切列表模式 → 左栏按号名找 → 点开 → 滚到底 → "
-                         "逐次推送取头条（地球 → 浏览器读 URL）"}
+                         "逐次推送取头条（⋯ → 复制链接 → 关标签）"}
 
     initial = nav.page_state(cfg)["mode"]
     gui.activate_wechat()
@@ -531,10 +739,11 @@ def grab_account(cfg: dict, name: str, limit: int, *, verbose: bool = True,
             try:
                 url = grab_headline(cfg, hl, verbose=verbose)
             except Exception as exc:
-                out = _write_urls(cfg, name, urls)
+                out = _write_urls(cfg, name, urls, partial=True)
                 raise _fail(
                     f"取《{hl.title or '（无标题）'}》（{hl.ts}）时失败，已停止。\n"
-                    f"  已取到 {len(urls)} 条，已写入 {out}（未写任何台账）\n"
+                    f"  本轮已取到 {len(urls)} 条，留在 {out}（partial，"
+                    "**没有覆盖上一次成功的 _raw_urls 文件**，也未写任何台账）\n"
                     f"  原因：{exc}")
             if url in urls:
                 skipped.append({"title": hl.title, "url": url,

@@ -208,26 +208,78 @@ def _toggle_box(cfg: dict, which: str) -> tuple[float, float, float, float]:
     return (x - 12, y - 10, x + 12, y + 10)
 
 
+def _nonwhite_ratio(path: str | Path,
+                    box: tuple[float, float, float, float],
+                    threshold: int = 245) -> float:
+    """截图某个矩形内「非纯白」像素的占比。识别不了返回 0.0（不冒充结论）。"""
+    x0, y0, x1, y1 = box
+    try:
+        img = feed_vision.decode_png(path)
+    except Exception:                                  # noqa: BLE001
+        return 0.0
+    sx = img.w / 1280.0 if img.w else 1.0
+    sy = img.h / 832.0 if img.h else 1.0
+    tot = hit = 0
+    for y in range(max(0, int(y0 / sy)), min(img.h, int(y1 / sy))):
+        row = img.rows[y]
+        for x in range(max(0, int(x0 / sx)), min(img.w, int(x1 / sx))):
+            i = x * img.ch
+            tot += 1
+            if img.ch >= 3:
+                if min(row[i], row[i + 1], row[i + 2]) < threshold:
+                    hit += 1
+            elif row[i] < threshold:
+                hit += 1
+    return hit / tot if tot else 0.0
+
+
+def left_pane_present(cfg: dict,
+                      image_path: str | Path | None = None) -> bool:
+    """左栏（一列公众号）在不在 —— 这是**列表模式唯一干净的结构判据**。
+
+    取左右栏分界线附近那一条竖带（x≈619，y 150~700）：列表模式下它整条
+    都被左栏底色/分割线盖住，非白占比 **98.8%~100%**；卡片流是 17%~32%，
+    文章页 30% —— 三者差得很开，阈值 0.90 没有灰区。
+
+    为什么不用「中栏 (593,60) 有暗像素」当判据（早先的写法）：文章页顶部
+    被 Chromium 的**标签栏**占据，那个位置上正好是标签文字，暗像素够多，
+    于是文章页会被误判成列表模式 —— 这正是第一次实跑「点了标题却判定没
+    打开文章、重试后卡住」的原因。左栏存不存在不受标签栏影响。
+    """
+    path = image_path or _shot(cfg)
+    ui = cfg["ui"]
+    x_edge = float(ui["account_list_x"][1])          # 618：左栏右边界
+    box = (x_edge - 2, 150.0, x_edge + 5, 700.0)
+    need = float(ui.get("account_left_ratio", 0.90))
+    return _nonwhite_ratio(path, box) >= need
+
+
 def page_state(cfg: dict, image_path: str | Path | None = None) -> dict:
-    """当前是不是「公众号」页、是哪种形态。纯像素，不碰 OCR。
+    """当前是「公众号」页的哪种形态。纯像素，不碰 OCR。
 
-    判据（2026-11-08 实测）：
+    判据（2026-11-08 二次实测）：
 
-    * **列表模式**：中栏表头 (593,60) 那个「切回卡片」图标有 52 个暗像素；
-      卡片模式下同一位置是 0（那里什么都没有）。这一条最干净。
-    * **卡片模式**：能数到 ≥2 张卡片且不是号列表形态。
+    * **列表模式**：左栏（一列公众号）存在，见 `left_pane_present()`：
+      分界线那一竖带非白占比 98.8%~100%，卡片流 17%~32%、文章页 30%。
+      早先用的「中栏 (593,60) 暗像素」在**文章页**会被标签栏文字骗到，
+      已废弃——它让文章页被当成列表模式，进而点不开下一行。
+    * **卡片模式**：没有左栏，但能数到 ≥2 张卡片且不是号列表形态。
     * 右上角 (1250,60) **不能**当判据：列表模式是「公众号主页」人像图标、
       卡片模式是「切列表」图标，两边都有暗像素（实测 101 / 128）。
     """
     path = image_path or _shot(cfg)
     cards = read_cards(cfg, path)
-    if _dark_count(path, _toggle_box(cfg, "card"), 175) >= 20:
-        return {"mode": "list", "cards": cards, "image": str(path)}
+    if left_pane_present(cfg, path):
+        return {"mode": "list", "cards": cards, "image": str(path),
+                "left_pane": True}
     if len(cards) >= 2 and not looks_like_account_list(cards):
-        return {"mode": "card", "cards": cards, "image": str(path)}
+        return {"mode": "card", "cards": cards, "image": str(path),
+                "left_pane": False}
     if looks_like_account_list(cards):
-        return {"mode": "list", "cards": cards, "image": str(path)}
-    return {"mode": "unknown", "cards": cards, "image": str(path)}
+        return {"mode": "list", "cards": cards, "image": str(path),
+                "left_pane": False}
+    return {"mode": "unknown", "cards": cards, "image": str(path),
+            "left_pane": False}
 
 
 def switch_mode(cfg: dict, want: str, *, verbose: bool = True) -> str:

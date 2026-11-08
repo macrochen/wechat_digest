@@ -234,6 +234,56 @@ class TestGrabAccountAborts(unittest.TestCase):
                     self.CFG, "猫笔刀", ["https://mp.weixin.qq.com/s/xyz"])
                 self.assertEqual(path.name, "_raw_urls-猫笔刀.json")
 
+    def test_partial_never_overwrites_the_last_good_file(self):
+        """中途失败只留 partial；上一轮辛苦抓到的整份链接不能被 0 条覆盖。"""
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(account, "project_path",
+                                   side_effect=lambda *p: Path(d).joinpath(*p)):
+                full = account._write_urls(
+                    self.CFG, "EarlETF",
+                    ["https://mp.weixin.qq.com/s/old1",
+                     "https://mp.weixin.qq.com/s/old2"])
+                before = full.read_text(encoding="utf-8")
+                part = account._write_urls(self.CFG, "EarlETF", [],
+                                           partial=True)
+                self.assertEqual(part.name, "_raw_urls_partial-EarlETF.json")
+                self.assertEqual(full.read_text(encoding="utf-8"), before)
+
+    def test_mid_run_failure_writes_partial_only(self):
+        from src.grab import GrabAborted
+        row = account.AccountRow(name="EarlETF", x=380, y=117, title="头条")
+        hl = account.Headline(title="标题", x=800, y=300, key="k", ts="08:30")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            outdir = root / "out"
+            outdir.mkdir()
+            old = '{"count": 7, "urls": ["https://mp.weixin.qq.com/s/old"]}'
+            (outdir / "_raw_urls-EarlETF.json").write_text(old,
+                                                           encoding="utf-8")
+            with mock.patch("src.grab.preflight"), \
+                 mock.patch.object(account.nav, "page_state",
+                                   return_value={"mode": "list"}), \
+                 mock.patch.object(account.nav, "to_feed"), \
+                 mock.patch.object(account.gui, "activate_wechat"), \
+                 mock.patch.object(account, "find_account", return_value=row), \
+                 mock.patch.object(account, "open_account"), \
+                 mock.patch.object(account, "scroll_to_bottom",
+                                   return_value={"at_bottom": True}), \
+                 mock.patch.object(account, "headlines", return_value=[hl]), \
+                 mock.patch.object(account, "grab_headline",
+                                   side_effect=GrabAborted("boom")), \
+                 mock.patch.object(account, "_scroll_pane"), \
+                 mock.patch.object(account, "project_path",
+                                   side_effect=lambda *p: root.joinpath(*p)):
+                with self.assertRaises(GrabAborted) as ctx:
+                    account.grab_account(self.CFG, "EarlETF", 3, verbose=False)
+            self.assertIn("partial", str(ctx.exception))
+            self.assertEqual(
+                (outdir / "_raw_urls-EarlETF.json").read_text(encoding="utf-8"),
+                old)
+            self.assertTrue(
+                (outdir / "_raw_urls_partial-EarlETF.json").exists())
+
 
 class TestScopePaths(unittest.TestCase):
     """按号抓取的产物必须与信息流那份**物理隔离**，台账不隔离。"""
@@ -329,6 +379,154 @@ class TestReviewScope(unittest.TestCase):
         self.assertIn("function query()", page)
         # 关键一行：POST 必须拼上 ?scope=，否则提交会落到另一个 scope
         self.assertIn("fetch(path + query()", page)
+
+
+def _png(path: Path, blocks: list[tuple[int, int, int, int]],
+         w: int = 1280, h: int = 832) -> Path:
+    """写一张 8-bit RGB、filter=0 的 PNG：白底 + 若干黑矩形 (x0,x1,y0,y1)。
+
+    只为测标签栏的像素定位；不依赖 screencapture，也不需要 Pillow。
+    """
+    import struct
+    import zlib
+
+    def chunk(typ: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + typ + data +
+                struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF))
+
+    lines = []
+    for y in range(h):
+        row = bytearray(b"\xff" * (w * 3))
+        for x0, x1, y0, y1 in blocks:
+            if y0 <= y < y1:
+                for x in range(x0, min(x1, w)):
+                    row[x * 3:x * 3 + 3] = b"\x00\x00\x00"
+        lines.append(b"\x00" + bytes(row))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    blob = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(b"".join(lines))) +
+            chunk(b"IEND", b""))
+    path.write_bytes(blob)
+    return path
+
+
+# 实测这一屏（2026-11-08，全屏标签页）的标签栏暗像素簇，逻辑坐标：
+#   65..76 导航 / 99..114 favicon / 123..268 标题文字 / 291..298 × /
+#   325..336 放大镜 / 1206..1226 地球 / 1236..1260 ⋯
+_TOOLBAR_BLOCKS = [
+    (65, 77, 42, 56), (99, 115, 41, 57),
+    (123, 180, 43, 55), (185, 205, 43, 55),
+    (210, 234, 43, 55), (243, 269, 43, 55),
+    (291, 299, 46, 52),          # ×
+    (325, 337, 46, 52),          # 放大镜
+    (1206, 1226, 43, 55),        # 地球（这个版本有）
+    (1236, 1260, 43, 55),        # ⋯（永远在最右）
+]
+WIN = {"x": 0.0, "y": 29.0, "w": 1280.0, "h": 803.0}
+
+
+class TestToolbarButtons(unittest.TestCase):
+    """标签栏按钮按窗口几何 + 像素现算，绝不写死坐标。
+
+    用户 2026-11-08 反馈：这个版本的工具栏「有时只有 ⋯，有时在 ⋯ 左边
+    多一个小地球」，而且文章窗口可能全屏、可能是浮窗。写死 (1218,48)
+    在前者点中地球（把文章甩进浏览器）、在后者连工具栏都够不着。
+    """
+
+    def test_close_and_more_land_on_the_right_icons(self):
+        with tempfile.TemporaryDirectory() as d:
+            shot = _png(Path(d) / "tb.png", _TOOLBAR_BLOCKS)
+            row = account._toolbar_row(shot, WIN)
+            self.assertTrue(40 <= row <= 60, row)
+            close = account._close_button(shot, WIN, row)
+            more = account._more_button(shot, WIN, row)
+            self.assertIsNotNone(close)
+            self.assertIsNotNone(more)
+            self.assertAlmostEqual(close[0], 294.5, delta=3)
+            self.assertAlmostEqual(more[0], 1248, delta=4)
+            # 「⋯」在最右，「×」在左侧标签上，两者绝不能混
+            self.assertLess(close[0], 400)
+            self.assertGreater(more[0], 1200)
+
+    def test_no_globe_version_still_finds_more(self):
+        """只有 ⋯ 没有地球时也必须定位到 ⋯（用户说的两种形态之一）。"""
+        blocks = [b for b in _TOOLBAR_BLOCKS if b[0] != 1206]
+        with tempfile.TemporaryDirectory() as d:
+            shot = _png(Path(d) / "tb.png", blocks)
+            row = account._toolbar_row(shot, WIN)
+            more = account._more_button(shot, WIN, row)
+            self.assertIsNotNone(more)
+            self.assertAlmostEqual(more[0], 1248, delta=4)
+
+    def test_close_tracks_title_width(self):
+        """标签标题短了，× 跟着左移；写死坐标必错。"""
+        shifted = [(x0, x1, y0, y1) if x0 < 120 or x0 > 300 else
+                   (x0 - 60, x1 - 60, y0, y1)
+                   for x0, x1, y0, y1 in _TOOLBAR_BLOCKS]
+        with tempfile.TemporaryDirectory() as d:
+            shot = _png(Path(d) / "tb.png", shifted)
+            row = account._toolbar_row(shot, WIN)
+            close = account._close_button(shot, WIN, row)
+            self.assertIsNotNone(close)
+            self.assertAlmostEqual(close[0], 234.5, delta=3)
+
+    def test_blank_toolbar_returns_none_instead_of_clicking(self):
+        with tempfile.TemporaryDirectory() as d:
+            shot = _png(Path(d) / "blank.png", [])
+            self.assertIsNone(account._close_button(shot, WIN, 49))
+            self.assertIsNone(account._more_button(shot, WIN, 49))
+
+
+class TestCloseArticle(unittest.TestCase):
+    """关标签：点算出来的 ×，且必须确认真的回到列表模式。"""
+
+    CFG = {"ui": {"logical_width": 1280, "logical_height": 832,
+                  "account_close_wait": 0}}
+
+    def test_closes_and_verifies_list_mode(self):
+        from src.grab import GrabAborted
+        with tempfile.TemporaryDirectory() as d:
+            shot = _png(Path(d) / "tb.png", _TOOLBAR_BLOCKS)
+            with mock.patch.object(account, "_wechat_window", return_value=WIN), \
+                 mock.patch.object(account.gui, "screenshot", return_value=shot), \
+                 mock.patch.object(account, "_is_article_page", return_value=False), \
+                 mock.patch.object(account.nav, "page_state",
+                                   return_value={"mode": "list",
+                                                 "image": str(shot)}), \
+                 mock.patch.object(account.gui, "click") as click, \
+                 mock.patch.object(account, "_sleep"):
+                account._close_article(self.CFG, verbose=False)
+            self.assertEqual(click.call_count, 1)
+            x, y = click.call_args.args
+            self.assertAlmostEqual(x, 294.5, delta=3)
+            self.assertTrue(40 <= y <= 60)
+
+    def test_aborts_when_close_button_missing(self):
+        from src.grab import GrabAborted
+        with tempfile.TemporaryDirectory() as d:
+            shot = _png(Path(d) / "blank.png", [])
+            with mock.patch.object(account, "_wechat_window", return_value=WIN), \
+                 mock.patch.object(account.gui, "screenshot", return_value=shot), \
+                 mock.patch.object(account.gui, "click") as click:
+                with self.assertRaises(GrabAborted):
+                    account._close_article(self.CFG, verbose=False)
+            click.assert_not_called()
+
+    def test_aborts_when_not_back_in_list_mode(self):
+        """点了 × 却切到卡片流 / 仍是文章页，必须停轮而不是继续点下一屏。"""
+        from src.grab import GrabAborted
+        with tempfile.TemporaryDirectory() as d:
+            shot = _png(Path(d) / "tb.png", _TOOLBAR_BLOCKS)
+            with mock.patch.object(account, "_wechat_window", return_value=WIN), \
+                 mock.patch.object(account.gui, "screenshot", return_value=shot), \
+                 mock.patch.object(account, "_is_article_page", return_value=False), \
+                 mock.patch.object(account.nav, "page_state",
+                                   return_value={"mode": "card",
+                                                 "image": str(shot)}), \
+                 mock.patch.object(account.gui, "click"), \
+                 mock.patch.object(account, "_sleep"):
+                with self.assertRaises(GrabAborted):
+                    account._close_article(self.CFG, verbose=False)
 
 
 if __name__ == "__main__":
