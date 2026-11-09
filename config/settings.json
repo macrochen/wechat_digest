@@ -1,5 +1,9 @@
 {
-  "max_articles": 20,
+  "feed_scope": 1,
+  "feed_days": 2,
+  "auto_summary": 1,
+  "max_articles": 120,
+  "account_max_pushes": 20,
   "dedup_threshold": 0.75,
   "batch_size": 15,
   "max_parallel": 3,

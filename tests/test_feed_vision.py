@@ -493,9 +493,17 @@ class TestCopyLinkPoint(unittest.TestCase):
 class TestAutoSkip(unittest.TestCase):
     """自动抓取里「文章被删」应跳过换下一张，而不是整轮停下。"""
 
+    def setUp(self):
+        # 不要把台账 / 闸门写进真实 out/。
+        p = mock.patch.object(grab, "_persist_ledger", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
+
     CFG = {"ui": {**DEFAULTS["ui"],
                   "logical_width": LW, "logical_height": LH,
-                  "auto_rounds": 2, "auto_fail_streak": 2,
+                  # 完备性改造后跨屏一律重新点开（靠 URL 去重），这些单屏
+                  # 行为用例只跑一屏，避免 mock 的返回序列被第二屏耗尽。
+                  "auto_rounds": 1, "auto_fail_streak": 2,
                   "auto_skip_streak": 4, "title_probe": 1}}
 
     def _cards(self, n):
@@ -525,6 +533,7 @@ class TestAutoSkip(unittest.TestCase):
              mock.patch.object(nav, "read_cards",
                                return_value=self._cards(2)), \
              mock.patch.object(nav, "recover", return_value=True), \
+             mock.patch.object(grab, "_screen_texts", return_value=[]), \
              mock.patch.object(grab, "_open_and_copy", side_effect=fake_open), \
              mock.patch.object(grab, "_write_urls",
                                return_value=(Path("/tmp/_raw_urls.json"), [url])), \
@@ -549,6 +558,7 @@ class TestAutoSkip(unittest.TestCase):
              mock.patch.object(nav, "_shot", return_value="/tmp/x.png"), \
              mock.patch.object(nav, "read_cards", return_value=cards), \
              mock.patch.object(nav, "recover", return_value=True), \
+             mock.patch.object(grab, "_screen_texts", return_value=[]), \
              mock.patch.object(grab, "_open_and_copy", side_effect=always_skip), \
              mock.patch.object(grab, "_write_urls",
                                return_value=(Path("/tmp/_raw_urls.json"), [])), \

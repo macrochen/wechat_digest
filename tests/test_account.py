@@ -145,6 +145,7 @@ class TestHeadlines(unittest.TestCase):
 
 class TestScrollToBottom(unittest.TestCase):
     CFG = {"ui": {"account_bottom_confirm": 2, "account_scroll_step": 8,
+                  "account_bottom_rounds": 4,
                   "account_scroll_x": 900, "account_scroll_y": 480,
                   "scroll_wait": 0}}
 
@@ -157,17 +158,38 @@ class TestScrollToBottom(unittest.TestCase):
             r = account.scroll_to_bottom(self.CFG, verbose=False)
         self.assertTrue(r["at_bottom"])
 
-    def test_reports_not_bottom_when_never_settles(self):
+    def test_never_settling_aborts_instead_of_grabbing_stale_articles(self):
+        """滚不到底就继续取 = 静默抓几个月前的旧推送，必须停轮。"""
+        from src.grab import GrabAborted
         n = {"i": 0}
 
         def growing(*a, **k):
             n["i"] += 1
             return (n["i"],)
         with mock.patch.object(account, "_pane_sig", side_effect=growing), \
+             mock.patch.object(account, "_scroll_pane") as sp:
+            with self.assertRaises(GrabAborted) as ctx:
+                account.scroll_to_bottom(self.CFG, verbose=False)
+        self.assertIn("没判定到底", str(ctx.exception))
+        self.assertEqual(sp.call_count, 4)
+
+    def test_empty_signature_never_counts_as_settled(self):
+        """某一屏没读到时间行，不能因此就判「到底」。"""
+        from src.grab import GrabAborted
+        with mock.patch.object(account, "_pane_sig", return_value=()), \
              mock.patch.object(account, "_scroll_pane"):
-            r = account.scroll_to_bottom(self.CFG, verbose=False)
-        self.assertFalse(r["at_bottom"])
-        self.assertEqual(r["rounds"], 14)
+            with self.assertRaises(GrabAborted):
+                account.scroll_to_bottom(self.CFG, verbose=False)
+
+    def test_pane_sig_uses_only_timestamp_lines(self):
+        """正文/浮标的 OCR 抖动不能影响「到底」判定。"""
+        cfg = {"ui": {"account_pane_left": 620}}
+        texts = [T("昨天 08:31", 850, 500, 90, 16),
+                 T("正文第一段内容", 760, 540, 300, 20),
+                 T("11月1日 07:32", 850, 620, 110, 16),
+                 T("本站精华", 700, 790, 80, 14)]
+        self.assertEqual(account._pane_sig(cfg, texts),
+                         ("昨天 08:31", "11月1日 07:32"))
 
 
 class TestFindAccount(unittest.TestCase):
@@ -212,8 +234,8 @@ class TestGrabAccountAborts(unittest.TestCase):
                  mock.patch.object(account.nav, "page_state",
                                    return_value={"mode": "list"}), \
                  mock.patch.object(account.nav, "to_feed"), \
-                 mock.patch.object(account, "_close_article"), \
                  mock.patch.object(account.gui, "activate_wechat"), \
+                 mock.patch.object(account, "_pane_header", return_value=None), \
                  mock.patch.object(account, "find_account", return_value=None), \
                  mock.patch.object(account, "_write_urls") as w:
                 with self.assertRaises(GrabAborted) as ctx:
@@ -221,6 +243,56 @@ class TestGrabAccountAborts(unittest.TestCase):
             self.assertIn("没找到", str(ctx.exception))
             w.assert_not_called()          # 一条都没取到，不落任何文件
             self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_already_on_target_account_skips_left_pane_search(self):
+        """右栏已经开着目标号时，不该再去左栏扫 8 屏还白停一轮。
+
+        上次中断后接着跑、或用户手工点开号，都是这种状态；左栏往往停在
+        别的位置，find_account 反而找不到。
+        """
+        hdr = mock.Mock(text="EarlETF")
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch("src.grab.preflight"), \
+             mock.patch.object(account.nav, "page_state",
+                               return_value={"mode": "list"}), \
+             mock.patch.object(account.nav, "to_feed"), \
+             mock.patch.object(account.gui, "activate_wechat"), \
+             mock.patch.object(account, "_pane_header", return_value=hdr), \
+             mock.patch.object(account, "find_account") as find, \
+             mock.patch.object(account, "open_account") as open_, \
+             mock.patch.object(account, "scroll_to_bottom",
+                               return_value={"at_bottom": True}), \
+             mock.patch.object(account, "headlines", return_value=[]), \
+             mock.patch.object(account, "_scroll_pane"), \
+             mock.patch.object(account, "project_path",
+                               side_effect=lambda *p: Path(d).joinpath(*p)):
+            res = account.grab_account(self.CFG, "EarlETF", 1, verbose=False)
+        find.assert_not_called()
+        open_.assert_not_called()
+        self.assertEqual(res["account_title"], "EarlETF")
+        self.assertEqual(res["count"], 0)
+
+    def test_wrong_pane_header_still_goes_to_left_pane(self):
+        """右栏是别的号时，不能偷懒跳过找号（否则取成别人家的文章）。"""
+        hdr = mock.Mock(text="猫笔刀")
+        row = account.AccountRow(name="EarlETF", x=380, y=120, title="头条")
+        with mock.patch("src.grab.preflight"), \
+             mock.patch.object(account.nav, "page_state",
+                               return_value={"mode": "list"}), \
+             mock.patch.object(account.nav, "to_feed"), \
+             mock.patch.object(account.gui, "activate_wechat"), \
+             mock.patch.object(account, "_pane_header", return_value=hdr), \
+             mock.patch.object(account, "find_account", return_value=row) as find, \
+             mock.patch.object(account, "open_account") as open_:
+            with mock.patch.object(account, "scroll_to_bottom",
+                                   return_value={"at_bottom": True}), \
+                 mock.patch.object(account, "headlines", return_value=[]), \
+                 mock.patch.object(account, "_scroll_pane"), \
+                 mock.patch.object(account, "_write_urls",
+                                   return_value=Path("/tmp/x.json")):
+                account.grab_account(self.CFG, "EarlETF", 1, verbose=False)
+        find.assert_called_once()
+        open_.assert_called_once()
 
     def test_zero_limit_rejected_before_touching_ui(self):
         with mock.patch("src.grab.preflight"):
@@ -235,62 +307,200 @@ class TestGrabAccountAborts(unittest.TestCase):
                     self.CFG, "猫笔刀", ["https://mp.weixin.qq.com/s/xyz"])
                 self.assertEqual(path.name, "_raw_urls-猫笔刀.json")
 
-    def test_partial_never_overwrites_the_last_good_file(self):
-        """中途失败只留 partial；上一轮辛苦抓到的整份链接不能被 0 条覆盖。"""
-        with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(account, "project_path",
-                                   side_effect=lambda *p: Path(d).joinpath(*p)):
-                full = account._write_urls(
-                    self.CFG, "EarlETF",
-                    ["https://mp.weixin.qq.com/s/old1",
-                     "https://mp.weixin.qq.com/s/old2"])
-                before = full.read_text(encoding="utf-8")
-                part = account._write_urls(self.CFG, "EarlETF", [],
-                                           partial=True)
-                self.assertEqual(part.name, "_raw_urls_partial-EarlETF.json")
-                self.assertEqual(full.read_text(encoding="utf-8"), before)
 
-    def test_mid_run_failure_writes_partial_only(self):
+class TestCloseArticle(unittest.TestCase):
+    """关标签：Cmd+W 首选（带安全门），OCR 点「×」只作兜底。"""
+
+    WIN = {"x": 0.0, "y": 29.0, "w": 1280.0, "h": 803.0}
+
+    def setUp(self):
+        # 快捷键真会发系统事件，所有用例都必须拦住；进程级「Cmd+W 是否有效」
+        # 的记忆也要在用例之间复位。
+        prev = account._CMDW_STATE
+        patcher = mock.patch.multiple(account.gui, press_escape=mock.DEFAULT,
+                                      cmd_key=mock.DEFAULT)
+        self.gui = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(setattr, account, "_CMDW_STATE", prev)
+        account._CMDW_STATE = None
+        self.CFG = {"ui": {"account_close_cmdw_rounds": 3,
+                           "account_cmdw_wait": 0,
+                           "account_close_wait": 0,
+                           "logical_width": 1280, "logical_height": 832}}
+
+    def test_glued_title_line_is_recognized_and_points_at_row_end(self):
+        texts = [T("= 两个风险平价追踪2611 ×", 100, 42, 204, 16),
+                 T("Q", 322, 42, 16, 16),
+                 T("#…", 1212, 42, 48, 16)]
+        marks = account._close_marks(texts, self.WIN)
+        self.assertEqual(len(marks), 1)
+        x, y = account._close_point(marks[0])
+        self.assertAlmostEqual(x, 297)       # right - 7 = 100+204-7
+        self.assertAlmostEqual(y, 50)
+
+    def test_standalone_x_uses_its_center(self):
+        x, _ = account._close_point(T("×", 288, 42, 14, 16))
+        self.assertAlmostEqual(x, 295)
+
+    def test_already_back_on_list_is_a_noop(self):
+        with mock.patch.object(account, "_is_article_page", return_value=False), \
+             mock.patch.object(account.gui, "screenshot") as shot:
+            account._close_article({"ui": {"account_close_wait": 0}},
+                                   verbose=False)
+        shot.assert_not_called()
+
+    def test_close_failure_keeps_the_already_copied_url(self):
+        url = "https://mp.weixin.qq.com/s/abc"
+        with mock.patch.object(account.nav, "ensure_focus"), \
+             mock.patch.object(account.gui, "click"), \
+             mock.patch.object(account, "_is_article_page", return_value=True), \
+             mock.patch.object(account, "_copy_link_via_menu",
+                               return_value=url), \
+             mock.patch.object(account, "_close_article",
+                               side_effect=RuntimeError("关不掉")):
+            with self.assertRaises(RuntimeError) as ctx:
+                account.grab_headline({"ui": {"account_open_wait": 0}},
+                                     account.Headline("标题", 800, 300, "k"),
+                                     verbose=False)
+        self.assertEqual(ctx.exception.partial_url, url)
+
+    # ---- Cmd+W 首选路径 --------------------------------------------------
+
+    def test_cmdw_is_preferred_and_no_ocr_is_needed(self):
+        with mock.patch.object(account, "_is_article_page",
+                               side_effect=[True, True, False]), \
+             mock.patch.object(account, "_cmdw_guard", return_value=None), \
+             mock.patch.object(account, "_main_window_alive",
+                               return_value=True), \
+             mock.patch.object(account, "_close_by_ocr") as by_ocr, \
+             mock.patch.object(account.ocr, "recognize") as recognize:
+            account._close_article(self.CFG, verbose=False)
+        self.gui["cmd_key"].assert_called_once_with(13)
+        self.gui["press_escape"].assert_called_once()
+        by_ocr.assert_not_called()
+        recognize.assert_not_called()
+        self.assertTrue(account._CMDW_STATE)
+
+    def test_escape_alone_closes_tab_without_keypress(self):
+        # 直接调 _close_by_cmdw：第一次 _is_article_page 就是 Esc 之后的复验
+        with mock.patch.object(account, "_is_article_page",
+                               side_effect=[False]), \
+             mock.patch.object(account, "_cmdw_guard", return_value=None):
+            self.assertTrue(account._close_by_cmdw(self.CFG, rounds=3,
+                                                   verbose=False))
+        self.gui["cmd_key"].assert_not_called()
+
+    def test_residual_tabs_are_closed_one_by_one(self):
+        # Esc1 / 按1后 / Esc2 / 按2后：第二个标签关掉才回列表
+        with mock.patch.object(account, "_is_article_page",
+                               side_effect=[True, True, True, False]), \
+             mock.patch.object(account, "_cmdw_guard", return_value=None), \
+             mock.patch.object(account, "_main_window_alive",
+                               return_value=True):
+            self.assertTrue(account._close_by_cmdw(self.CFG, rounds=3,
+                                                   verbose=False))
+        self.assertEqual(self.gui["cmd_key"].call_count, 2)
+
+    def test_cmdw_is_never_sent_when_guard_refuses(self):
+        with mock.patch.object(account, "_cmdw_guard",
+                               return_value="前台 App 不是微信"), \
+             mock.patch.object(account, "_main_window_alive",
+                               return_value=True):
+            self.assertFalse(account._close_by_cmdw(self.CFG, rounds=3,
+                                                    verbose=False))
+        self.gui["cmd_key"].assert_not_called()
+        self.gui["press_escape"].assert_not_called()
+
+    def test_main_window_disappearing_stops_immediately(self):
+        with mock.patch.object(account, "_is_article_page", return_value=True), \
+             mock.patch.object(account, "_cmdw_guard", return_value=None), \
+             mock.patch.object(account, "_main_window_alive",
+                               return_value=False):
+            with self.assertRaises(Exception) as ctx:
+                account._close_by_cmdw(self.CFG, rounds=3, verbose=False)
+        self.assertIn("主窗口", str(ctx.exception))
+        self.assertEqual(self.gui["cmd_key"].call_count, 1)
+
+    def test_guard_rejects_non_wechat_front_app(self):
+        with mock.patch.object(account.gui, "frontmost_app",
+                               return_value="WorkBuddy"):
+            self.assertIn("前台 App", account._cmdw_guard() or "")
+
+    def test_guard_rejects_missing_main_window(self):
+        with mock.patch.object(account.gui, "frontmost_app",
+                               return_value="微信"), \
+             mock.patch.object(account.winpos, "windows", return_value=[]):
+            self.assertIn("主窗口", account._cmdw_guard() or "")
+
+    def test_ineffective_cmdw_falls_back_and_is_not_retried(self):
+        with mock.patch.object(account, "_is_article_page", return_value=True), \
+             mock.patch.object(account, "_close_by_cmdw",
+                               return_value=False) as by_cmdw, \
+             mock.patch.object(account, "_close_by_ocr") as by_ocr:
+            account._close_article(self.CFG, verbose=False)
+            account._close_article(self.CFG, verbose=False)
+        by_cmdw.assert_called_once()          # 第二次直接用 OCR，不空等快捷键
+        self.assertEqual(by_ocr.call_count, 2)
+        self.assertFalse(account._CMDW_STATE)
+
+    def test_rounds_zero_skips_cmdw_entirely(self):
+        cfg = {"ui": dict(self.CFG["ui"], account_close_cmdw_rounds=0)}
+        with mock.patch.object(account, "_is_article_page", return_value=True), \
+             mock.patch.object(account, "_close_by_cmdw") as by_cmdw, \
+             mock.patch.object(account, "_close_by_ocr") as by_ocr:
+            account._close_article(cfg, verbose=False)
+        by_cmdw.assert_not_called()
+        by_ocr.assert_called_once()
+
+
+class TestPartialWrites(unittest.TestCase):
+    """中途失败不能把上一轮那份完整链接覆盖成 0 条（实盘踩过）。"""
+
+    def test_partial_goes_to_its_own_file(self):
+        import json
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(account, "project_path",
+                               side_effect=lambda *p: Path(d).joinpath(*p)):
+            main = account._write_urls({}, "EarlETF", ["https://mp.weixin.qq.com/s/old"])
+            before = main.read_text(encoding="utf-8")
+            part = account._write_urls({}, "EarlETF", [], partial=True)
+            self.assertEqual(part.name, "_raw_urls_partial-EarlETF.json")
+            self.assertEqual(main.read_text(encoding="utf-8"), before)
+            self.assertTrue(json.loads(part.read_text(encoding="utf-8"))["partial"])
+
+    def test_failed_run_writes_partial_including_copied_url(self):
         import json
         from src.grab import GrabAborted
-        row = account.AccountRow(name="EarlETF", x=380, y=117, title="头条")
+        cfg = {"ui": {"account_scan_rounds": 1, "account_scroll_step": 8},
+               "max_articles": 20}
         hl = account.Headline(title="标题", x=800, y=300, key="k", ts="08:30")
         err = GrabAborted("关标签失败")
         err.partial_url = "https://mp.weixin.qq.com/s/got"
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            outdir = root / "out"
-            outdir.mkdir()
-            old = '{"count": 7, "urls": ["https://mp.weixin.qq.com/s/old"]}'
-            (outdir / "_raw_urls-EarlETF.json").write_text(old,
-                                                           encoding="utf-8")
+            (root / "out").mkdir()
+            main = root / "out" / "_raw_urls-EarlETF.json"
+            main.write_text('{"count": 7}', encoding="utf-8")
             with mock.patch("src.grab.preflight"), \
                  mock.patch.object(account.nav, "page_state",
                                    return_value={"mode": "list"}), \
                  mock.patch.object(account.nav, "to_feed"), \
-                 mock.patch.object(account, "_close_article"), \
                  mock.patch.object(account.gui, "activate_wechat"), \
-                 mock.patch.object(account, "find_account", return_value=row), \
-                 mock.patch.object(account, "open_account"), \
+                 mock.patch.object(account, "_pane_header",
+                                   return_value=mock.Mock(text="EarlETF")), \
                  mock.patch.object(account, "scroll_to_bottom",
                                    return_value={"at_bottom": True}), \
                  mock.patch.object(account, "headlines", return_value=[hl]), \
                  mock.patch.object(account, "grab_headline", side_effect=err), \
-                 mock.patch.object(account, "_scroll_pane"), \
                  mock.patch.object(account, "project_path",
                                    side_effect=lambda *p: root.joinpath(*p)):
-                with self.assertRaises(GrabAborted) as ctx:
-                    account.grab_account(self.CFG, "EarlETF", 3, verbose=False)
-            self.assertIn("partial", str(ctx.exception))
-            self.assertEqual(
-                (outdir / "_raw_urls-EarlETF.json").read_text(encoding="utf-8"),
-                old)
-            partial = outdir / "_raw_urls_partial-EarlETF.json"
-            self.assertTrue(partial.exists())
-            # 「链接已复制但关标签失败」那条不能丢
-            self.assertEqual(
-                json.loads(partial.read_text(encoding="utf-8"))["urls"],
-                ["https://mp.weixin.qq.com/s/got"])
+                with self.assertRaises(GrabAborted):
+                    account.grab_account(cfg, "EarlETF", 3, verbose=False)
+            self.assertEqual(json.loads(main.read_text())["count"], 7)
+            part = json.loads((root / "out" / "_raw_urls_partial-EarlETF.json")
+                              .read_text())
+            self.assertEqual(part["urls"], ["https://mp.weixin.qq.com/s/got"])
+            self.assertTrue(part["partial"])
 
 
 class TestScopePaths(unittest.TestCase):
@@ -387,235 +597,6 @@ class TestReviewScope(unittest.TestCase):
         self.assertIn("function query()", page)
         # 关键一行：POST 必须拼上 ?scope=，否则提交会落到另一个 scope
         self.assertIn("fetch(path + query()", page)
-
-
-def _png(path: Path, blocks: list[tuple], w: int = 1280, h: int = 832,
-         bg: tuple[int, int, int] = (255, 255, 255)) -> Path:
-    """写一张 8-bit RGB、filter=0 的 PNG：背景色 + 若干矩形。
-
-    块是 (x0, x1, y0, y1) 或 (x0, x1, y0, y1, (r,g,b))。
-    只为测像素定位；不依赖 screencapture，也不需要 Pillow。
-    """
-    import struct
-    import zlib
-
-    def chunk(typ: bytes, data: bytes) -> bytes:
-        return (struct.pack(">I", len(data)) + typ + data +
-                struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF))
-
-    lines = []
-    for y in range(h):
-        row = bytearray(bytes(bg) * w)
-        for block in blocks:
-            x0, x1, y0, y1 = block[:4]
-            color = bytes(block[4]) if len(block) > 4 else b"\x00\x00\x00"
-            if y0 <= y < y1:
-                for x in range(x0, min(x1, w)):
-                    row[x * 3:x * 3 + 3] = color
-        lines.append(b"\x00" + bytes(row))
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    blob = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
-            chunk(b"IDAT", zlib.compress(b"".join(lines))) +
-            chunk(b"IEND", b""))
-    path.write_bytes(blob)
-    return path
-
-
-# 实测这一屏（2026-11-08，全屏标签页）的标签栏暗像素簇，逻辑坐标：
-#   65..76 导航 / 99..114 favicon / 123..268 标题文字 / 291..298 × /
-#   325..336 放大镜 / 1206..1226 地球 / 1236..1260 ⋯
-_TOOLBAR_BLOCKS = [
-    (65, 77, 42, 56), (99, 115, 41, 57),
-    (123, 180, 43, 55), (185, 205, 43, 55),
-    (210, 234, 43, 55), (243, 269, 43, 55),
-    (291, 299, 46, 52),          # ×
-    (325, 337, 46, 52),          # 放大镜
-    (1206, 1226, 43, 55),        # 地球（这个版本有）
-    (1236, 1260, 43, 55),        # ⋯（永远在最右）
-]
-WIN = {"x": 0.0, "y": 29.0, "w": 1280.0, "h": 803.0}
-
-
-class TestToolbarButtons(unittest.TestCase):
-    """标签栏按钮按窗口几何 + 像素现算，绝不写死坐标。
-
-    用户 2026-11-08 反馈：这个版本的工具栏「有时只有 ⋯，有时在 ⋯ 左边
-    多一个小地球」，而且文章窗口可能全屏、可能是浮窗。写死 (1218,48)
-    在前者点中地球（把文章甩进浏览器）、在后者连工具栏都够不着。
-    """
-
-    def test_close_and_more_land_on_the_right_icons(self):
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "tb.png", _TOOLBAR_BLOCKS)
-            row = account._toolbar_row(shot, WIN)
-            self.assertTrue(40 <= row <= 60, row)
-            close = account._close_button(shot, WIN, row)
-            more = account._more_button(shot, WIN, row)
-            self.assertIsNotNone(close)
-            self.assertIsNotNone(more)
-            self.assertAlmostEqual(close[0], 294.5, delta=3)
-            self.assertAlmostEqual(more[0], 1248, delta=4)
-            # 「⋯」在最右，「×」在左侧标签上，两者绝不能混
-            self.assertLess(close[0], 400)
-            self.assertGreater(more[0], 1200)
-
-    def test_no_globe_version_still_finds_more(self):
-        """只有 ⋯ 没有地球时也必须定位到 ⋯（用户说的两种形态之一）。"""
-        blocks = [b for b in _TOOLBAR_BLOCKS if b[0] != 1206]
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "tb.png", blocks)
-            row = account._toolbar_row(shot, WIN)
-            more = account._more_button(shot, WIN, row)
-            self.assertIsNotNone(more)
-            self.assertAlmostEqual(more[0], 1248, delta=4)
-
-    def test_close_tracks_title_width(self):
-        """标签标题短了，× 跟着左移；写死坐标必错。"""
-        shifted = [(x0, x1, y0, y1) if x0 < 120 or x0 > 300 else
-                   (x0 - 60, x1 - 60, y0, y1)
-                   for x0, x1, y0, y1 in _TOOLBAR_BLOCKS]
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "tb.png", shifted)
-            row = account._toolbar_row(shot, WIN)
-            close = account._close_button(shot, WIN, row)
-            self.assertIsNotNone(close)
-            self.assertAlmostEqual(close[0], 234.5, delta=3)
-
-    def test_blank_toolbar_returns_none_instead_of_clicking(self):
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "blank.png", [])
-            self.assertIsNone(account._close_button(shot, WIN, 49))
-            self.assertIsNone(account._more_button(shot, WIN, 49))
-
-
-class TestCloseArticle(unittest.TestCase):
-    """关标签：算 × → 轮询等列表页回来；残留标签要连着关。"""
-
-    CFG = {"ui": {"logical_width": 1280, "logical_height": 832,
-                  "account_close_wait": 0, "account_close_poll": 0,
-                  "account_close_max": 3}}
-
-    @staticmethod
-    def _state(mode: str, shot) -> dict:
-        return {"mode": mode, "image": str(shot)}
-
-    def test_already_in_list_mode_is_a_noop(self):
-        """启动时界面本来就干净，不能因为「清残留标签」去乱点。"""
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "tb.png", _TOOLBAR_BLOCKS)
-            with mock.patch.object(account.nav, "page_state",
-                                   return_value=self._state("list", shot)), \
-                 mock.patch.object(account, "_is_article_page",
-                                   return_value=False), \
-                 mock.patch.object(account.gui, "click") as click:
-                account._close_article(self.CFG, verbose=False)
-            click.assert_not_called()
-
-    def test_closes_and_waits_for_list_mode(self):
-        """关闭有动画：第一次判还是 card，轮询到 list 才算完。"""
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "tb.png", _TOOLBAR_BLOCKS)
-            seen = {"n": 0}
-
-            def fake_state(*_a, **_kw):
-                seen["n"] += 1
-                return self._state("list" if seen["n"] >= 2 else "card", shot)
-
-            with mock.patch.object(account, "_wechat_window", return_value=WIN), \
-                 mock.patch.object(account.gui, "screenshot", return_value=shot), \
-                 mock.patch.object(account, "_is_article_page",
-                                   return_value=False), \
-                 mock.patch.object(account.nav, "page_state",
-                                   side_effect=fake_state), \
-                 mock.patch.object(account.gui, "click") as click, \
-                 mock.patch.object(account, "_sleep"):
-                account._close_article(self.CFG, verbose=False)
-            self.assertEqual(click.call_count, 1)
-            x, y = click.call_args.args
-            self.assertAlmostEqual(x, 294.5, delta=3)
-            self.assertTrue(40 <= y <= 60)
-            self.assertGreaterEqual(seen["n"], 2)   # 确实轮询过
-
-    def test_aborts_when_close_button_missing(self):
-        """没有 × 又不在列表模式 → 只切形态，绝不盲点文章页工具栏。"""
-        from src.grab import GrabAborted
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "blank.png", [])
-            with mock.patch.object(account, "_wechat_window", return_value=WIN), \
-                 mock.patch.object(account.gui, "screenshot", return_value=shot), \
-                 mock.patch.object(account.nav, "page_state",
-                                   return_value=self._state("card", shot)), \
-                 mock.patch.object(account.nav, "switch_mode") as switch, \
-                 mock.patch.object(account.gui, "click") as click:
-                with self.assertRaises(GrabAborted):
-                    account._close_article(self.CFG, verbose=False)
-            click.assert_not_called()
-            switch.assert_called_once()
-
-    def test_residual_tabs_are_closed_up_to_the_limit_then_stop(self):
-        """残留多个文章标签：连关 max 个仍不回列表就停，且不碰形态切换按钮。"""
-        from src.grab import GrabAborted
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "tb.png", _TOOLBAR_BLOCKS)
-            with mock.patch.object(account, "_wechat_window", return_value=WIN), \
-                 mock.patch.object(account.gui, "screenshot", return_value=shot), \
-                 mock.patch.object(account.nav, "page_state",
-                                   return_value=self._state("card", shot)), \
-                 mock.patch.object(account.nav, "switch_mode") as switch, \
-                 mock.patch.object(account.gui, "click") as click, \
-                 mock.patch.object(account, "_sleep"):
-                with self.assertRaises(GrabAborted):
-                    account._close_article(self.CFG, verbose=False)
-            self.assertEqual(click.call_count, self.CFG["ui"]["account_close_max"])
-            switch.assert_not_called()   # 还在文章页，点切换按钮会误触工具栏
-
-
-class TestCoverCenter(unittest.TestCase):
-    """纯图推送：时间行下整张封面，OCR 读不出标题时用像素找点击锚点。"""
-
-    CFG = {"ui": {"account_footer_y": 782,
-                  "account_title_x": [760, 1200],
-                  "account_title_left_max": 870,
-                  "account_title_max_h": 24,
-                  "account_title_hard_max": 48,
-                  "account_cover_x": 850}}
-
-    def test_picks_only_the_first_content_block(self):
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "pane.png",
-                        [(770, 1130, 200, 260, (200, 30, 30)),
-                         (770, 1130, 320, 380, (30, 30, 200))],
-                        bg=(245, 245, 245))
-            self.assertAlmostEqual(account._cover_center(shot, 150, 500),
-                                   230, delta=3)
-
-    def test_flat_gray_background_returns_none(self):
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "gray.png", [], bg=(245, 245, 245))
-            self.assertIsNone(account._cover_center(shot, 150, 500))
-
-    def test_headlines_falls_back_to_cover_when_no_title_line(self):
-        texts = [T("星期四 07:32", 850, 300, 110, 16)]
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "pane.png",
-                        [(770, 1130, 340, 410, (200, 30, 30))],
-                        bg=(245, 245, 245))
-            hls = account.headlines(self.CFG, texts=texts, path=shot)
-        self.assertEqual(len(hls), 1)
-        self.assertEqual(hls[0].title, "")
-        self.assertEqual(hls[0].x, 850)
-        self.assertAlmostEqual(hls[0].y, 375, delta=4)
-        self.assertTrue(hls[0].key.startswith("cover:"))
-
-    def test_real_title_still_wins_over_cover(self):
-        texts = [T("昨天 08:31", 850, 300, 90, 16),
-                 T("真正的头条", 760, 330, 260, 20)]
-        with tempfile.TemporaryDirectory() as d:
-            shot = _png(Path(d) / "pane.png",
-                        [(770, 1130, 340, 410, (200, 30, 30))],
-                        bg=(245, 245, 245))
-            hls = account.headlines(self.CFG, texts=texts, path=shot)
-        self.assertEqual([h.title for h in hls], ["真正的头条"])
 
 
 if __name__ == "__main__":

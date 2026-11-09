@@ -35,9 +35,9 @@ from .config import inbox_matches, project_path
 from .state import load_json
 
 
-# 当前服务在看哪一份候选池："" = 信息流那份，否则是按号抓取那份（号名）。
-# 一个常驻服务一次只服务一个 scope（主程序启动时传入），/review 与
-# /api/status 都跟着它走，避免两份简报混在同一个清单页里。
+# 服务启动时默认的候选池："" = 信息流那份，否则是按号抓取那份（号名）。
+# 实际每**次请求**的 scope 以 ?scope= 为准（见 _Handler.request_scope），
+# 没带参数才退回这里，因为同一个常驻服务会先后服务两份简报。
 _ACTIVE_SCOPE = ""
 
 
@@ -233,12 +233,24 @@ _NAV_CSS = """<style>
 </style>"""
 
 
-def nav_html(active: str, has_review: bool) -> str:
-    items = []
-    if has_review:
-        items.append(("review", "/review", "选文清单"))
-    items.append(("read", "/read", "本地阅读"))
-    items.append(("settings", "/settings", "参数设置"))
+def nav_html(active: str, has_review: bool | None = None,
+             scope: str | None = None) -> str:
+    """三页共用的顶部导航。**三个入口永远都在**，与候选池状态无关。
+
+    曾把「选文清单」绑在 `has_review` 上：只有 /review 页硬编码 True，
+    于是从清单页跳到 /settings（没带 ?scope=，退回启动 scope 后找不到
+    按号抓取那份候选池）时，导航就只剩两项，用户以为页面回不去了。
+    「一个服务、一个端口、三页同在」是产品约定，显隐不该由数据决定；
+    没有待确认清单时 /review 本来就会给提示页。
+
+    `has_review` 只为兼容旧调用保留，不参与渲染。`scope` 不为 None 时，
+    每个链接都带 `?scope=`（空串也带），保证从任意一页点回清单不会丢 scope。
+    """
+    q = "" if scope is None else "?scope=" + quote(scope or "")
+    items = [("review", "/review" + q, "选文清单"),
+             ("grab", "/grab" + q, "本轮文章"),
+             ("read", "/read" + q, "本地阅读"),
+             ("settings", "/settings" + q, "参数设置")]
     links = "".join(
         f'<a href="{href}" class="{"on" if key == active else ""}">{text}</a>'
         for key, href, text in items)
@@ -298,8 +310,133 @@ def _auto_notice(scope: str | None = None) -> str:
 
 
 def build_no_review_page(scope: str | None = None) -> str:
-    return (NO_REVIEW_PAGE.replace("__NAV__", nav_html("", False), 1)
+    return (NO_REVIEW_PAGE.replace("__NAV__", nav_html("", scope=scope or ""), 1)
             .replace("__AUTO__", _auto_notice(scope), 1))
+
+
+GRAB_PAGE = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公众号简报 · 本轮文章</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:28px 20px 60px; background:#f6f7f9; color:#1f2329;
+         font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:1080px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#667085; font-size:13px; margin-bottom:18px; }
+  .count { display:inline-block; background:#fff; border:1px solid #e4e7ec;
+           border-radius:8px; padding:8px 14px; margin-bottom:14px; font-size:13px; color:#475467; }
+  .count b { color:#101828; font-size:16px; }
+  table { width:100%; border-collapse:collapse; background:#fff; border:1px solid #e4e7ec;
+          border-radius:10px; overflow:hidden; }
+  th, td { padding:11px 14px; text-align:left; border-bottom:1px solid #f0f1f3;
+           font-size:13px; vertical-align:top; }
+  th { background:#f9fafb; color:#475467; font-weight:600; white-space:nowrap; }
+  tr:last-child td { border-bottom:0; }
+  tr:hover td { background:#fafbfc; }
+  .idx { color:#98a2b3; width:40px; font-variant-numeric:tabular-nums; }
+  .t { font-weight:600; color:#101828; text-decoration:none; }
+  .t:hover { color:#2563eb; text-decoration:underline; }
+  .src { color:#667085; font-size:12px; }
+  .empty { padding:40px; text-align:center; color:#667085; background:#fff;
+           border:1px solid #e4e7ec; border-radius:10px; }
+  .note { margin-top:18px; color:#667085; font-size:12px; line-height:1.9; }
+  .note b { color:#344054; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>公众号简报 · 本轮文章</h1>
+  <div class="sub" id="sub"></div>
+  <div class="count" id="count"></div>
+  <table><thead><tr><th>#</th><th>标题</th><th>公众号</th><th>发布时间</th></tr></thead>
+    <tbody id="rows"></tbody></table>
+  <div class="note">
+    本页<b>只读</b>：只列本轮要总结的新文章，已经总结过或处理过的文章不会出现在这里。<br>
+    要开始总结请到 <a href="/review?scope=__SCOPE__">选文清单</a> 勾选后点「开始总结」。
+  </div>
+</div>
+<script>
+const D = __DATA__;
+const A = D.articles || [];
+const $ = id => document.getElementById(id);
+function el(tag, cls, txt) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (txt != null) e.textContent = String(txt);
+  return e;
+}
+$('sub').textContent = D.empty
+  ? '这一轮还没有可总结的文章。'
+  : '日期 ' + D.date + ' · 生成于 ' + D.generated_at;
+$('count').appendChild(el('span', '', '本轮 '));
+$('count').appendChild(el('b', '', A.length));
+$('count').appendChild(el('span', '', ' 篇'));
+const box = $('rows');
+A.forEach((r, i) => {
+  const tr = el('tr');
+  tr.appendChild(el('td', 'idx', i + 1));
+  const td = el('td');
+  const u = String(r.url || '');
+  if (/^https?:\/\//.test(u)) {
+    const a = el('a', 't', r.title);
+    a.href = u; a.target = '_blank'; a.rel = 'noopener';
+    td.appendChild(a);
+  } else { td.appendChild(el('span', 't', r.title)); }
+  tr.appendChild(td);
+  tr.appendChild(el('td', 'src', r.source || '（无公众号名）'));
+  tr.appendChild(el('td', 'src', r.published_at || '时间未知'));
+  box.appendChild(tr);
+});
+if (!A.length) {
+  const tr = el('tr'), td = el('td', 'empty', '这一轮没有新文章');
+  td.colSpan = 4; tr.appendChild(td); box.appendChild(tr);
+}
+</script>
+</body>
+</html>
+"""
+
+
+def latest_grab_review(scope: str = "") -> dict | None:
+    """当前 scope 下最新一份抓取明细；没有就返回 None（页面给空态）。"""
+    files = sorted(project_path("out").glob("_grab_review-*.json"), reverse=True)
+    for f in files:
+        data = load_json(f, {})
+        if isinstance(data, dict) and (data.get("scope") or "") == (scope or ""):
+            return data
+    return None
+
+
+def build_grab_page(*, scope: str = "") -> str:
+    """`/grab`：只列本轮候选池里的新文章（纯只读）。
+
+    用户 2026-11-09 拍板：页面上**不出现**已总结过 / 已投递 / 被排除的文章，
+    也不做折叠区。所以在组装 HTML 数据时就把非 `in_inbox` 的行全部丢掉，
+    连内嵌 JSON 里都不带重复条目；明细数据文件本身仍保留全量分类供内部查账。
+    """
+    data = latest_grab_review(scope) or {}
+    rows = [r for r in (data.get("articles") or [])
+            if r.get("status") in (None, "in_inbox")]
+    payload = {
+        "date": data.get("date") or "",
+        "generated_at": data.get("generated_at") or "",
+        "empty": bool(data.get("empty")) or not rows,
+        "articles": [{"title": r.get("title") or "（未取到标题）",
+                      "url": r.get("url") or "",
+                      "source": r.get("source") or "",
+                      "published_at": r.get("published_at") or ""}
+                     for r in rows],
+    }
+    raw = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    return (GRAB_PAGE.replace(
+                "<body>", "<body>" + nav_html("grab", scope=scope), 1)
+            .replace("__DATA__", raw)
+            .replace("__SCOPE__", quote(scope or "")))
 
 
 SETTINGS_PAGE = r"""<!doctype html>
@@ -392,7 +529,8 @@ SETTINGS_PAGE = r"""<!doctype html>
     改动只写 <b>config/settings.local.json</b>（已 Git 忽略），主配置 <b>config/settings.json</b> 不动；
     写盘前自动生成 <b>.bak</b> 备份。<b>保存后下一条命令即生效</b>，不用重启服务。<br>
     令牌内容<b>不会</b>出现在这个页面，也不在这里修改；只显示是否已配置。<br>
-    命令行参数优先级更高：例如 <b>scan --max-articles 10</b> 会临时覆盖本页的「抓取篇数上限」，只影响那一次运行。
+    命令行参数优先级更高：例如 <b>scan --max-articles 10</b> / <b>scan --days 1</b> 会临时覆盖本页的「抓取篇数上限」/「抓取窗口天数」，只影响那一次运行。<br>
+    「抓取范围 = 1（最近 N 天全部）」时，抓取篇数上限只是<b>兜底值</b>：程序会一直往下滚，滚出这个窗口为止（默认 N=2：今天 + 昨天）。
   </div>
 </div>
 <script>
@@ -636,8 +774,8 @@ def _read_item(meta: dict, cur_id: str) -> str:
             f'<div class="m">{when}</div></a>')
 
 
-def build_read_page(selected: str | None = None,
-                    has_review: bool = False) -> str:
+def build_read_page(selected: str | None = None, *,
+                    scope: str | None = None) -> str:
     """只读归档：左侧按期列表，右侧渲染选中那期。无归档时给空态。"""
     items = archive.list_items()
     if not items:
@@ -663,15 +801,15 @@ def build_read_page(selected: str | None = None,
                     '<div class="body">' + archive.render_markdown(md) + '</div>')
         listing = "".join(_read_item(i, cur["id"]) for i in items)
     return (READ_PAGE.replace(
-        "<body>", "<body>" + nav_html("read", has_review), 1)
+        "<body>", "<body>" + nav_html("read", scope=scope), 1)
         .replace("__LIST__", listing).replace("__BODY__", body))
 
 
-def build_settings_page(has_review: bool = False) -> str:
+def build_settings_page(*, scope: str | None = None) -> str:
     """设置页首屏数据内嵌；不含任何令牌值。"""
     payload = json.dumps(settings_ui.current_state(), ensure_ascii=False).replace("</", "<\\/")
     return SETTINGS_PAGE.replace(
-        "<body>", "<body>" + nav_html("settings", has_review), 1
+        "<body>", "<body>" + nav_html("settings", scope=scope), 1
     ).replace("__SETTINGS_DATA__", payload)
 
 
@@ -701,8 +839,9 @@ def build_page(inbox: dict) -> str:
     }
     # 防止标题里的 </script> 提前闭合脚本
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    return PAGE.replace("<body>", "<body>" + nav_html("review", True), 1).replace(
-        "__DATA__", payload)
+    return PAGE.replace(
+        "<body>", "<body>" + nav_html("review", scope=inbox.get("scope") or ""), 1
+    ).replace("__DATA__", payload)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -750,11 +889,14 @@ class _Handler(BaseHTTPRequestHandler):
         box = self.active_inbox()
         review_on = box is not None
         if path == "/settings":
-            self._send(200, build_settings_page(review_on),
+            self._send(200, build_settings_page(scope=self.request_scope()),
                        "text/html; charset=utf-8")
         elif path == "/read":
             picked = (parse_qs(u.query).get("id") or [None])[0]
-            self._send(200, build_read_page(picked, review_on),
+            self._send(200, build_read_page(picked, scope=self.request_scope()),
+                       "text/html; charset=utf-8")
+        elif path == "/grab":
+            self._send(200, build_grab_page(scope=self.request_scope()),
                        "text/html; charset=utf-8")
         elif path == "/api/settings/get":
             try:
@@ -796,7 +938,7 @@ class _Handler(BaseHTTPRequestHandler):
             if review_on:
                 self._send(200, build_page(box), "text/html; charset=utf-8")
             elif path == "/":
-                self._send(200, build_settings_page(False),
+                self._send(200, build_settings_page(scope=self.request_scope()),
                            "text/html; charset=utf-8")
             elif self.dynamic:
                 self._send(200, build_no_review_page(self.request_scope()),

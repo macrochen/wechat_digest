@@ -272,7 +272,11 @@ class TestOffered(unittest.TestCase):
 
 
 class TestScanOfferedFilter(unittest.TestCase):
-    """scan 要真的把「上次投递过但没总结」的文章过滤掉，并自动打开清单页。"""
+    """scan 要真的把「上次投递过但没总结」的文章过滤掉，并自动打开清单页。
+
+    统一加 --confirm 压回人工：这里测的是 offered 台账，默认自动模式
+    会接着跑 hydrate，反而把关注点带偏。
+    """
 
     def _scan(self, root: Path, urls: list[str]):
         from src.main import run
@@ -293,7 +297,8 @@ class TestScanOfferedFilter(unittest.TestCase):
                 mock.patch("src.main.article.fetch_meta", side_effect=fake_meta), \
                 mock.patch("src.main.blacklist.load", return_value=[]), \
                 mock.patch("src.main._open_listing") as opened:
-            code = run(["scan", "--date", "2026-11-07", "--no-open"])
+            code = run(["scan", "--date", "2026-11-07", "--no-open",
+                        "--confirm"])
         return code, json.loads(
             (out / "inbox-2026-11-07.json").read_text(encoding="utf-8"))
 
@@ -340,7 +345,7 @@ class TestScanOfferedFilter(unittest.TestCase):
                     mock.patch("src.main.blacklist.load", return_value=[]), \
                     mock.patch("src.main._open_listing"):
                 run(["scan", "--date", "2026-11-07", "--include-offered",
-                     "--no-open"])
+                     "--no-open", "--confirm"])
             box = json.loads((root / "out" / "inbox-2026-11-07.json")
                              .read_text(encoding="utf-8"))
             self.assertEqual(len(box["articles"]), 1)
@@ -363,6 +368,67 @@ class TestWechatAppName(unittest.TestCase):
         from src import gui
         for name in ("loginwindow", "WorkBuddy", "WeChatWork", "", None):
             self.assertFalse(gui.is_wechat_app(name), name)
+
+
+class TestOpenAndCopyRecovery(unittest.TestCase):
+    """点击落空后的恢复路径必须能跑到 Space 检查。
+
+    2026-11-08 实盘踩坑：_open_and_copy 把 `from . import nav` 写在函数
+    结尾（只给 close_article 用），Python 因此把 nav 判成局部变量；而
+    「点击后文章窗口没打开」的恢复路径先引用 nav.ensure_onscreen，
+    必然抛 UnboundLocalError，被包装成「Space 检查失败」误报成界面问题。
+    这条路径平时走不到，所以原有的 159 个单测没覆盖。
+    """
+
+    def test_recovery_reaches_ensure_onscreen(self):
+        from src import feed_vision, grab, nav
+
+        cal = feed_vision.Calibration(
+            given_y=285.0, used_y=285.0, status="disabled",
+            detail="标题行校准已关闭")
+        cfg = {"ui": {"open_wait": 0}}
+
+        with mock.patch.object(grab, "_probe_title_y", return_value=cal), \
+                mock.patch.object(grab, "_guard_title",
+                                  side_effect=lambda c, x, y, used: y), \
+                mock.patch.object(grab, "_focus"), \
+                mock.patch.object(grab, "_sleep"), \
+                mock.patch.object(grab, "_article_window_state",
+                                  return_value=False), \
+                mock.patch.object(grab.gui, "clipboard_clear"), \
+                mock.patch.object(grab.gui, "click"), \
+                mock.patch.object(grab.gui, "activate_wechat"), \
+                mock.patch.object(nav, "ensure_onscreen") as onscreen:
+            with self.assertRaises(grab._CardFailed) as ctx:
+                grab._open_and_copy(cfg, 545, 285, set())
+
+        # Space 检查真的被调用了；失败原因是「窗口始终没打开」这个预期
+        # 的停轮结果，而不是 nav 未绑定导致的「Space 检查失败」。
+        self.assertEqual(onscreen.call_count, 1)
+        self.assertNotIn("Space 检查失败", str(ctx.exception))
+        self.assertIn("文章窗口始终没有打开", str(ctx.exception))
+
+
+class TestCloseArticleSafety(unittest.TestCase):
+    """Cmd+W 打给主窗口会把微信整个关掉（2026-11-08 实测两次）。"""
+
+    def test_unknown_window_state_never_sends_cmdw(self):
+        """读不到窗口信息时不知道快捷键会打给谁，宁可不按。"""
+        from src import nav
+        with mock.patch.object(nav, "article_window_open", return_value=None), \
+                mock.patch.object(nav.gui, "cmd_key") as cmd, \
+                mock.patch.object(nav, "_sleep"):
+            self.assertFalse(nav.close_article({"ui": {}}, tries=2))
+        self.assertEqual(cmd.call_count, 0)
+
+    def test_no_article_does_not_send_cmdw(self):
+        from src import nav
+        with mock.patch.object(nav, "article_window_open", return_value=False), \
+                mock.patch.object(nav, "ensure_focus"), \
+                mock.patch.object(nav.gui, "cmd_key") as cmd, \
+                mock.patch.object(nav, "_sleep"):
+            self.assertTrue(nav.close_article({"ui": {}}, tries=2))
+        self.assertEqual(cmd.call_count, 0)
 
 
 if __name__ == "__main__":

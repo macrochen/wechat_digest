@@ -19,8 +19,11 @@
    算工具栏行，再在这一行上找最右的图标簇。
 3. 取 URL 走「⋯ 菜单 → 复制链接」：菜单里有「转发给朋友 / 分享到朋友圈 / 收藏 /
    使用默认浏览器打开 / 添加浮窗 / 复制链接」，点「复制链接」直接把 URL 写进剪贴板。
-   **全程不开浏览器、不按 Cmd+W**（Cmd+W 在这个外壳里实测无效）。菜单项位置也用
-   OCR 找文字，不写死 y。
+   **全程不开浏览器**。菜单项位置也用 OCR 找文字，不写死 y。
+   关标签首选 **Cmd+W**（2026-11-08 用户实盘指出比 OCR 找「×」可靠）：快捷键不认
+   标签栏文字，多个残留标签也能一次一次关掉。但不能裸按——见 `_cmdw_guard()`。
+   早前记的「Cmd+W 在这个外壳里实测无效」多半是当时菜单没收、或快捷键发给了
+   主窗口；现在按完必复验，确实无效就自动退回原来的 OCR 点「×」。
 4. 右栏是聊天式时间线：每次推送上面有一行时间（「昨天 08:31」「星期三 07:31」），
    下面是这次推送的卡片；**卡片里第一张（带封面图的那条）才是头条**，同一次
    推送的其余几条不要——这就是用户说的「一天发了多篇，我只需要取第一篇」。
@@ -28,12 +31,9 @@
 
 分工
 ----
-* OCR（`ocr.py`）负责**认字与菜单项**：左栏号名、右栏时间行与标题文字、
-  「⋯」菜单里的「复制链接」。
-* **点击坐标以像素判据为主**：头条用 OCR 行的几何（x/y/字高）筛、标签栏按钮
-  用「窗口几何 + 暗像素聚簇」算；右栏封面图/缩略图会和标题粘成超高像素带，
-  所以这里**不用** `feed_vision.find_title_bands`（那是信息流卡片的判据）。
-  OCR 认错字最多让标题写歪，不会让点击落到别处。
+* OCR（`ocr.py`）只负责**认字**：左栏的号名、右栏的时间行、标题文字。
+* 点哪里仍然由**像素判据**决定（`feed_vision.find_title_bands` 找加粗标题带），
+  OCR 认错字也不会让点击落到别处。
 * 认不出、对不上、切不过去，一律 `GrabAborted`（退出码 3）停轮等人，
   绝不猜、不盲点、不挪坐标重试。
 """
@@ -52,6 +52,11 @@ from . import feed_vision, gui, nav, ocr, winpos
 from .config import project_path
 
 _SHOT = Path("/tmp/wd_acct.png")
+
+# Cmd+W 在本轮进程里是否被证实可用：None=还没试过 / True=可用 / False=已判无效。
+# 早前实测有过「按了没反应」的结论，若它成立，不能让 20 篇每篇都白等一轮快捷键；
+# 第一次失败后本轮直接走 OCR 兜底。跨轮不持久化，换环境会重新试。
+_CMDW_STATE: bool | None = None
 
 # 时间分隔行：「昨天 08:31」「星期三 07:31」「11月6日 08:31」。
 # 末尾允许最多 4 个非数字杂字符：OCR 实测会把分隔线读成「星期四 07:32|」，
@@ -278,12 +283,18 @@ class Headline:
 
 
 def _pane_sig(cfg: dict, texts: list[ocr.Text] | None = None) -> tuple:
-    """右栏内容的文字指纹（判断「滚动后有没有变化」，即有没有到底/到顶）。"""
+    """右栏**时间分隔行**的文字指纹（判断滚动有没有到底）。
+
+    早先取右栏所有文字：OCR 对正文换行、浮标、选中态的细微差异会让每一
+    次指纹都不同，滚 14 次也判不出「到底」，于是停在几个月前的旧推送上。
+    时间行数量少、文字稳定，是更可靠的锚点。空指纹不参与「没变化」计数，
+    免得某一屏没读到时间行就被误判成到底。
+    """
     ui = cfg["ui"]
     ts = texts if texts is not None else _texts(cfg)
     left = float(ui["account_pane_left"]) - 10
-    return tuple(t.text for t in sorted(ts, key=lambda t: t.y)
-                 if t.x >= left)
+    return tuple(t.text.strip() for t in sorted(ts, key=lambda t: t.y)
+                 if t.x >= left and _TS_RE.match((t.text or "").strip()))
 
 
 def _scroll_pane(cfg: dict, amount: int) -> None:
@@ -303,20 +314,26 @@ def scroll_to_bottom(cfg: dict, *, verbose: bool = True) -> dict:
     ui = cfg["ui"]
     need = max(1, int(ui.get("account_bottom_confirm", 2)))
     step = int(ui.get("account_scroll_step", 8))
+    rounds = int(ui.get("account_bottom_rounds", 30))
     prev = _pane_sig(cfg)
     same = 0
-    for i in range(1, 15):
+    for i in range(1, rounds + 1):
         _scroll_pane(cfg, -step)
         cur = _pane_sig(cfg)
-        same = same + 1 if cur == prev else 0
+        same = same + 1 if (cur and cur == prev) else 0
         prev = cur
         if same >= need:
             if verbose:
-                print(f"· 已滚到底（第 {i} 屏，连续 {same} 次无变化）", flush=True)
+                print(f"· 已滚到底（第 {i} 屏，连续 {same} 次时间行不变）",
+                      flush=True)
             return {"rounds": i, "at_bottom": True}
-    if verbose:
-        print("  ! 滚了 14 次还没到底，按当前屏继续", flush=True)
-    return {"rounds": 14, "at_bottom": False}
+    # 没到底就继续取，拿到的会是几个月前的旧推送，却会被当成「最新 20 篇」
+    # 写进候选池和台账。按项目铁律宁可停轮，不静默降级。
+    raise _fail(
+        f"滚了 {rounds} 屏仍没判定到底（时间行一直在变，或滚轮没生效）。\n"
+        "  没有「按当前屏继续」这条路：那样抓到的是旧文章，不是最新推送。\n"
+        "  请确认右栏能正常滚动（把鼠标停在右栏会话区），或调大 "
+        "ui.account_scroll_step / ui.account_bottom_rounds 后重跑。")
 
 
 def title_bands(cfg: dict, path: str | Path) -> list[feed_vision.Band]:
@@ -343,50 +360,6 @@ def _line_near(texts: list[ocr.Text], y: float, tol: float = 10) -> ocr.Text | N
     return min(cand, key=lambda t: abs(t.cy - y)) if cand else None
 
 
-def _cover_center(path: str | Path, y0: float, y1: float, *,
-                  x0: float = 770, x1: float = 1130,
-                  ratio: float = 0.30, min_run: float = 24) -> float | None:
-    """时间行下方**第一块卡片内容**的中心 y；纯图推送没有 OCR 标题时用它。
-
-    右栏背景是浅灰 (245,245,245)；卡片是白底或彩色封面。按行统计
-    x∈[770,1130] 里「彩色（max-min>25）或近白（min>250）」的像素占比：
-
-    ======  ==========================================  ==========
-    位置    实测（out/probe-pane-layout.png）            内容占比
-    ======  ==========================================  ==========
-    背景     y=80/100/430/445/470/560                    0.00
-    封面     y=130/250/500（红色）                        0.89~1.00
-    卡片白底 y=300/350（含灰字）、y=400                   0.39~1.00
-    ======  ==========================================  ==========
-
-    取占比 ≥0.30 的第一个连续 ≥24px 的段，段中心就是可点的封面/卡片内部。
-    **只取第一段** = 这次推送的头条卡片，组内第 2、3 篇天然被跳过。
-    """
-    img = feed_vision.decode_png(path)
-    sx, sy = img.w / 1280.0, img.h / 832.0
-    px0, px1 = int(x0 * sx), min(int(x1 * sx), img.w)
-    if px1 <= px0:
-        return None
-    run: list[float] = []
-    for py in range(max(0, int(y0 * sy)), min(int(y1 * sy), img.h)):
-        row = img.rows[py]
-        n = 0
-        for px in range(px0, px1):
-            i = px * img.ch
-            r, g, b = row[i], row[i + 1], row[i + 2]
-            if max(r, g, b) - min(r, g, b) > 25 or min(r, g, b) > 250:
-                n += 1
-        if n / (px1 - px0) >= ratio:
-            run.append(py / sy)
-        else:
-            if run and run[-1] - run[0] + 1 >= min_run:
-                return (run[0] + run[-1]) / 2
-            run = []
-    if run and run[-1] - run[0] + 1 >= min_run:
-        return (run[0] + run[-1]) / 2
-    return None
-
-
 def headlines(cfg: dict, texts: list[ocr.Text] | None = None,
               path: str | Path | None = None) -> list[Headline]:
     """本屏每一次推送的**头条**（组内第一条），按屏幕从上到下排列。
@@ -405,17 +378,12 @@ def headlines(cfg: dict, texts: list[ocr.Text] | None = None,
         x≈778~790；卡片右上角的「• clash：美国」这类位置标签 OCR 会读成
         x≈1145~1202 的一行字（h 也在 12~24 之间），只按「x ≥ 760」拦不住，
         点上去当然打不开文章；
-      * 高 12~48px：正文摘要和图片里的小字（实测 h=10）被排除；
+      * 高 12~30px：正文摘要和图片里的小字（实测 h=10）被排除；
       * **组内优先取高 12~24px 的行**：大图推送的封面**宣传语**会被 OCR 读成
-        28~43px 的大字（实测「指数盈利预测，」h=36.1 / 图上乱码 h=43），
-        它比真标题更靠上，有真标题时靠字号优先把它筛掉。
-        但**有些推送整张就是封面图**，时间行下面没有独立标题行，
-        卡在 30px 会让整组取不到任何行、往上翻变成空屏。
-        放宽到 48px 后这行成为点击锚点——实测点在封面里能打开头条文章。
+        28~36px 的大字（实测「指数盈利预测，」h=36.1 /「独家免费开放」h=28.8），
+        它比真标题更靠上，只按 12~30 过滤会把封面语当成头条、点上去等于点图片。
+        整组都没有标题字号的行时才退回宽松池（30px）。
       * 在时间线下方 6px 以外、400px 以内。
-      * **整组都读不出标题时**（纯图推送）不放弃这一组：改用
-        `_cover_center()` 在像素上找时间行下方第一块卡片内容的中心当锚点。
-        实测点在封面内部能打开头条文章；只取第一块 = 组内第一篇。
     """
     ui = cfg["ui"]
     path = path or _shot(cfg)
@@ -439,20 +407,6 @@ def headlines(cfg: dict, texts: list[ocr.Text] | None = None,
         hi = stamps[i + 1].y - 2 if i + 1 < len(stamps) else footer
         cand = [t for t in lines if lo < t.cy < hi and t.cy - st.cy < 400]
         if not cand:
-            # 纯图推送：时间行下方整张是封面，OCR 一行标题都读不出来。
-            # 实测点封面内部能打开头条文章，所以用像素找这块内容的中心当锚点，
-            # 而不是让这一屏变成「0 次推送」、连着两屏就误判到头了。
-            try:
-                cover = _cover_center(path, lo, min(hi, footer))
-            except (OSError, ValueError):
-                cover = None        # 截图读不出就当没有，不把整轮抓取带崩
-            if cover is not None:
-                out.append(Headline(
-                    title="",
-                    x=float(ui.get("account_cover_x", 850)),
-                    y=cover,
-                    key="cover:" + (normalize(st.text) or f"y{int(st.cy)}"),
-                    ts=st.text))
             continue
         tight = [t for t in cand if t.h <= h_tight]
         line = min(tight or cand, key=lambda t: t.y)    # 组内第一条 = 头条
@@ -615,144 +569,170 @@ def _copy_link_via_menu(cfg: dict, *, verbose: bool = True) -> str:
     return m.group(0)
 
 
-def _close_button(shot: str | Path, win: dict, y: float) -> tuple[float, float] | None:
-    """标签栏上**当前标签**的「×」中心（逻辑坐标）。
+def _close_marks(texts: list[ocr.Text], win: dict) -> list[ocr.Text]:
+    """标签栏里带「×」的行。
 
-    不能用 OCR 定位：Vision 把整个标签连同 × 和放大镜读成**一行**
-    （实测「= 华泰柏瑞的 ETF skill，非常强× Q」，bbox x=100..338），
-    「×」既不是独立行，bbox 中心也落在标题文字中间；早先还把候选限制在
-    窗口右半边 x≥640，而标签栏在**左侧**，于是必然找不到。
-
-    纯像素（实测这一屏的列聚簇，逻辑坐标）：
-
-    ======  ==================================  ==========
-    簇       x 范围                             含义
-    ======  ==================================  ==========
-    65..76   12px / 42                         后退/前进箭头
-    99..114  16px / 173                        标签 favicon
-    123..268 若干个 20~57px 的宽簇             标签标题文字
-    **291..298  8px / 22**                     **×（要点的）**
-    325..336 12px / 48                         放大镜（搜索标签）
-    ======  ==================================  ==========
-
-    规则：在工具栏行 y±10 的带里按列统计暗像素、聚簇，取宽 5~16px 的
-    「细簇」（标题文字都是 ≥20px 的宽簇），排除 x<90 的导航箭头；
-    **倒数第二个细簇就是 ×**（最后一个是放大镜）。这样标题长短、
-    有没有地球图标都不影响定位。
+    macOS Vision 常常把 × **并进标签标题**读成一行（实测
+    `'= 两个风险平价追踪2611 ×'`，x=100..304），也可能单独成行 `'×'`。
+    所以它不在窗口右半边，按「x > 半个窗口宽」找必然落空；这里只限定
+    标签栏的 y 区间和左半边（右侧是 🌐 / ⋯ 那一片，不该点）。
     """
-    img = feed_vision.decode_png(shot)
-    sx, sy = img.w / 1280.0, img.h / 832.0
-    x_lo = int((win["x"] + 55) * sx)
-    x_hi = min(int((win["x"] + 520) * sx), img.w)
-    prof: dict[int, int] = {}
-    for yy in range(int((y - 10) * sy), int((y + 10) * sy)):
-        if yy < 0 or yy >= img.h:
-            continue
-        row = img.rows[yy]
-        for x in range(max(0, x_lo), x_hi):
-            i = x * img.ch
-            if min(row[i], row[i + 1], row[i + 2]) < 170:
-                prof[x] = prof.get(x, 0) + 1
-    if not prof:
+    lo, hi = win["y"] + 10, win["y"] + 72
+    marks = "×✕✖xX"
+    return [t for t in texts
+            if any(m in (t.text or "") for m in marks)
+            and lo <= t.cy <= hi
+            and t.x < win["x"] + win["w"] * 0.6]
+
+
+def _close_point(t: ocr.Text) -> tuple[float, float]:
+    """这一行里 × 的可点位置：独立成行就点中心，并进标题就点行尾。"""
+    if (t.text or "").strip().strip("=·• ") in ("×", "✕", "✖", "x", "X"):
+        return t.cx, t.cy
+    # × 是标题行的最后一个字符，宽度约 10~14px；行尾往回 7px 稳落其上。
+    return t.right - 7, t.cy
+
+
+def _main_window_alive() -> bool | None:
+    """微信主窗口还在屏上吗。None = 窗口列表读不到，不误报。"""
+    ws = winpos.windows()
+    if ws is None:
         return None
-    cols = sorted(prof)
-    clusters: list[list[int]] = [[cols[0]]]
-    for c in cols[1:]:
-        if c - clusters[-1][-1] > 3:
-            clusters.append([c])
-        else:
-            clusters[-1].append(c)
-    thin = []
-    for cl in clusters:
-        x0, x1 = cl[0] / sx, cl[-1] / sx
-        total = sum(prof[i] for i in cl)
-        if 5 <= x1 - x0 + 1 <= 16 and total <= 90 and x0 >= win["x"] + 90:
-            thin.append((x0, x1))
-    if not thin:
-        return None
-    target = thin[-2] if len(thin) >= 2 else thin[-1]
-    return ((target[0] + target[1]) / 2, y)
+    return winpos.find_wechat(ws) is not None
 
 
-def _wait_for_list(cfg: dict, timeout: float) -> bool:
-    """关标签有动画，**轮询**等列表模式真的回来，不靠固定 sleep。"""
-    poll = float(cfg["ui"].get("account_close_poll", 0.4))
-    deadline = time.time() + float(timeout)
-    while True:
-        st = nav.page_state(cfg)
-        if st["mode"] == "list" and not _is_article_page(cfg, image_path=st.get("image")):
-            return True
-        if time.time() >= deadline:
-            return False
-        _sleep(poll)
+def _cmdw_guard() -> str | None:
+    """发 Cmd+W 前的安全门：返回「不能发」的原因，None = 可以发。
+
+    **Cmd+W 打给谁就关谁**，三种情形必须挡住：
+      * 前台 App 不是微信（WorkBuddy 常在工具调用后自己弹到最前）→ 快捷键
+        会关掉别人的窗口，而且微信这边什么都没发生；
+      * 微信主窗口不在屏上 → 说明已经被关掉了，再按只会更糟；
+      * 窗口列表读不到 → 无法确认打给谁，宁可不按。
+
+    历史坑：在主窗口上按 Cmd+W 会把微信整个关掉（窗口消失、之后所有截图都
+    拍不到它，只能手动点程序坞图标恢复，`open -a WeChat` 救不回来）。所以
+    按完还要查一次 `_main_window_alive()`，一旦主窗口没了立即停轮。
+    """
+    if not gui.is_wechat_app(gui.frontmost_app()):
+        return "前台 App 不是微信"
+    ws = winpos.windows()
+    if ws is None:
+        return "读不到微信窗口列表"
+    if winpos.find_wechat(ws) is None:
+        return "微信主窗口不在屏幕上"
+    return None
 
 
-def _close_article(cfg: dict, *, verbose: bool = True,
-                   max_close: int | None = None) -> None:
-    """关文章标签，回到公众号列表模式。
+def _close_by_cmdw(cfg: dict, *, rounds: int, verbose: bool = True) -> bool:
+    """用 Cmd+W 关文章标签，返回「左栏是否真的回来了」。
 
-    两个实测坑叠在一起（2026-11-08 实跑第一篇就停在这里）：
-
-    1. **关闭有动画**：点完 × 固定等 1.4s 就去判形态，看到的还是旧画面，
-       于是误报「没回到列表模式」。改成每 0.4s 轮询一次、最多等 3s。
-    2. **会残留多个标签**：上次异常退出留下的文章标签还在，关掉当前这个
-       微信只是切到下一个文章标签，仍然是文章页。所以循环点 ×，
-       最多 `account_close_max` 个，直到左栏那列号真的回来。
-
-    × 的位置随标签数量/标题长短变化，用 `_close_button()` 现算，不写死坐标。
-    **不用 Cmd+W** —— 在这个 Chromium 外壳里实测按了没有任何反应
-    （`nav.close_article()` 那套 Cmd+W 在这里清不掉残留标签）。
+    一次只关一个标签：之前 OCR 方案踩过「几个残留文章标签叠着」的情况，
+    快捷键正好可以一轮一轮关干净，每轮都复验，不靠猜。
     """
     ui = cfg["ui"]
-    timeout = float(ui.get("account_close_wait", 3.0))
-    tries = int(max_close or ui.get("account_close_max", 4))
-    last_btn: tuple[float, float] | None = None
-    for i in range(1, tries + 1):
-        st = nav.page_state(cfg)
-        if st["mode"] == "list" and not _is_article_page(cfg, image_path=st.get("image")):
-            return
-        win = _wechat_window(cfg)
-        if win is None:
-            break
-        shot = gui.screenshot(_SHOT)
-        row = _toolbar_row(shot, win)
-        btn = _close_button(shot, win, row)
-        if btn is None:
-            last_btn = None
-            break
+    wait = float(ui.get("account_cmdw_wait", 1.0))
+    for i in range(1, max(1, int(rounds)) + 1):
+        reason = _cmdw_guard()
+        if reason:
+            if _main_window_alive() is False:
+                raise _fail("微信主窗口不在屏幕上，不能继续关标签。\n"
+                            "  请点程序坞里的微信图标恢复主窗口后重跑。")
+            if verbose:
+                print(f"  · 不发 Cmd+W：{reason}", flush=True)
+            return False
+        # 菜单没收起时快捷键会被它吃掉（信息流链路实测过），先 Esc 收掉。
+        gui.press_escape()
+        _sleep(0.2)
+        if not _is_article_page(cfg):
+            return True                 # Esc 自己就把标签收了
         if verbose:
-            print(f"  · 关闭文章标签（{btn[0]:.0f},{btn[1]:.0f}"
-                  f"{'，第 ' + str(i) + ' 个' if i > 1 else ''}）", flush=True)
-        gui.click(btn[0], btn[1])
-        last_btn = btn
-        if _wait_for_list(cfg, timeout):
-            return
+            print(f"  · Cmd+W 关文章标签（第 {i}/{rounds} 次）", flush=True)
+        gui.cmd_key(13)                 # 13 = kVK_ANSI_W
+        _sleep(wait)
+        if _main_window_alive() is False:
+            raise _fail(
+                "Cmd+W 关掉的是微信主窗口，不是文章标签。\n"
+                "  请点程序坞里的微信图标把主窗口恢复出来、切回公众号列表模式后重跑。\n"
+                "  若这台机器上 Cmd+W 每次都关主窗口，把 ui.account_close_cmdw_rounds\n"
+                "  设为 0 可完全跳过快捷键，只用 OCR 点「×」。")
+        if not _is_article_page(cfg):
+            return True
+        if verbose:
+            print("  · 左栏还没回来，可能还有残留标签，再按一次", flush=True)
+    return False
 
-    st = nav.page_state(cfg)
-    if st["mode"] == "list" and not _is_article_page(cfg, image_path=st.get("image")):
+
+def _close_by_ocr(cfg: dict, *, verbose: bool = True) -> None:
+    """兜底：按 OCR 那一行的右端定位「×」，点完复验左栏回来。
+
+    Cmd+W 不可用 / 无效时才走这里。保留原来那套逻辑，标签数量一变位置就变，
+    所以仍按行尾现算，不写死坐标。
+    """
+    ui = cfg["ui"]
+    win = _wechat_window(cfg)
+    if win is None:
+        raise _fail("找不到微信窗口，无法关闭文章标签。")
+    shot = gui.screenshot(_SHOT)
+    texts = ocr.recognize(shot, logical_width=ui["logical_width"],
+                          logical_height=ui["logical_height"])
+    cand = _close_marks(texts, win)
+    if not cand:
+        raise _fail(
+            "Cmd+W 没关掉标签，标签栏上也没读到「×」，不知道点哪里关文章。\n"
+            f"  现场截图：{shot}\n"
+            "  请手工关掉这个文章标签后重跑。")
+    # 多个标签时取最靠右那个（最新打开的通常在最右）
+    t = max(cand, key=lambda t: t.right)
+    for i, dx in enumerate((0, -7), start=1):
+        x, y = _close_point(t)
+        x += dx
+        if verbose:
+            print(f"  · 关闭文章标签（{x:.0f},{y:.0f}，第 {i} 次）", flush=True)
+        gui.click(x, y)
+        _sleep(ui.get("account_close_wait", 1.4))
+        if not _is_article_page(cfg):
+            return
+        if verbose:
+            print("  · 左栏还没回来，换个位置再点一次", flush=True)
+    raise _fail(
+        "Cmd+W 和两次「×」都没关掉文章标签（左栏没回来）。\n"
+        f"  现场截图：{shot}\n"
+        "  请手工关掉文章标签并切回公众号列表模式后重跑。")
+
+
+def _close_article(cfg: dict, *, verbose: bool = True) -> None:
+    """关掉当前文章标签，回到公众号列表模式。
+
+    首选 **Cmd+W**（用户 2026-11-08 实盘建议）：不依赖标签栏 OCR，多个残留
+    标签也能逐个关。发键前过 `_cmdw_guard()`，按完复验左栏回来。
+    如果这台机器上快捷键确实无效（早前有过一次实测结论），本轮进程记住并
+    退回 OCR 点「×」，不让 20 篇每篇都白等一轮快捷键。
+    """
+    global _CMDW_STATE
+    # 点完「复制链接」后，微信有时自己就把标签关了、回到列表页。
+    # 这时再动手只会误报「关不掉」，所以先做幂等判断。
+    if not _is_article_page(cfg):
+        if verbose:
+            print("  · 文章标签已关闭（左栏已回来），跳过", flush=True)
         return
-    # 还有 × 说明仍在文章页 —— 这时绝不能点形态切换按钮（那个位置在文章页
-    # 是工具栏图标，点下去会开浏览器）。直接停轮让人接手。
-    if last_btn is not None:
-        raise _fail(
-            f"连关 {tries} 个文章标签后仍在文章页（识别为 {st['mode']}）。\n"
-            f"  现场截图：{st.get('image')}\n"
-            "  请手工关掉剩下的文章标签、切回列表模式后重跑。")
-    # 没有 × 了：已经回到公众号页，只是形态是卡片流 —— 安全，切一下
-    nav.switch_mode(cfg, "list", verbose=verbose)
-    st = nav.page_state(cfg)
-    if st["mode"] != "list":
-        raise _fail(
-            f"关完文章标签后没能切回列表模式（识别为 {st['mode']}）。\n"
-            f"  现场截图：{st.get('image')}\n"
-            "  请手工切回列表模式后重跑。")
+    rounds = int(cfg["ui"].get("account_close_cmdw_rounds", 3))
+    if rounds > 0 and _CMDW_STATE is not False:
+        if _close_by_cmdw(cfg, rounds=rounds, verbose=verbose):
+            _CMDW_STATE = True
+            return
+        _CMDW_STATE = False
+        if verbose:
+            print("  · Cmd+W 这条路没走通，本轮改用 OCR 点「×」", flush=True)
+    _close_by_ocr(cfg, verbose=verbose)
 
 
 def grab_headline(cfg: dict, hl: Headline, *, verbose: bool = True,
                   tries: int = 2) -> str:
-    """取一篇头条的链接：点标题 → 「⋯」菜单 → 「复制链接」→ 关标签。
+    """取一篇头条的链接：点标题 → 「⋯」菜单 → 「复制链接」→ Cmd+W 关标签。
 
-    **不开浏览器、不按 Cmd+W**。标签栏按钮按窗口几何现算，不再写死坐标。
+    **不开浏览器**。标签栏按钮按窗口几何现算，不再写死坐标；关标签默认走
+    Cmd+W（带安全门），失效才退回 OCR 点「×」。
     """
     ui = cfg["ui"]
     opened = False
@@ -775,12 +755,11 @@ def grab_headline(cfg: dict, hl: Headline, *, verbose: bool = True,
     url = _copy_link_via_menu(cfg, verbose=verbose)
     try:
         _close_article(cfg, verbose=verbose)
-    except Exception as exc:               # noqa: BLE001 - 链接要留下来
-        # 链接已经拿到了，不能因为「没回到列表模式」把它一起丢掉：
-        # 挂到异常上，让 grab_account 写进 partial 文件。
-        err = _fail(f"链接已取到，但没回到列表模式：{exc}")
-        err.partial_url = url
-        raise err
+    except Exception as exc:
+        # 链接已经复制到了，别让「关标签失败」把它一起丢掉；调用方会把它
+        # 写进 partial 文件（不覆盖上一轮那份完整的链接）。
+        exc.partial_url = url
+        raise
     return url
 
 
@@ -788,14 +767,13 @@ def grab_headline(cfg: dict, hl: Headline, *, verbose: bool = True,
 
 def _write_urls(cfg: dict, name: str, urls: list[str],
                 *, partial: bool = False) -> Path:
-    """写本轮结果。**失败留底走 partial，绝不覆盖上一次成功的整份文件**。
+    """写链接清单。中途失败只写 `*_partial*.json`，**不碰主文件**。
 
-    `scan --urls-file` 只认 `_raw_urls-<号名>.json`；partial 是给人看的
-    现场证据，不进正式链路，所以单独一个文件名。
+    一次跑 20 篇，跑到第 1 篇就失败时，如果把空/半截结果写进主文件，
+    上一轮辛苦抓到的整份链接就没了（2026-11-08 实盘踩过）。
     """
     import json
-    stem = (f"_raw_urls_partial-{slug(name)}.json" if partial
-            else f"_raw_urls-{slug(name)}.json")
+    stem = f"_raw_urls{'_partial' if partial else ''}-{slug(name)}.json"
     out = project_path("out", stem)
     payload = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                "account": name, "count": len(urls), "urls": urls,
@@ -816,22 +794,28 @@ def grab_account(cfg: dict, name: str, limit: int, *, verbose: bool = True,
         raise AccountError("篇数必须大于 0")
     if dry_run:
         return {"dry_run": True, "account": name, "limit": limit,
-                "would": "切列表模式 → 左栏按号名找 → 点开 → 滚到底 → "
-                         "逐次推送取头条（⋯ → 复制链接 → 关标签）"}
+                "would": "切列表模式 → 确认右栏是目标号（不是就在左栏找）→ "
+                         "滚到底 → 逐次推送取头条（⋯ → 复制链接 → Cmd+W 关标签）"}
 
     initial = nav.page_state(cfg)["mode"]
     gui.activate_wechat()
-    # 上次异常退出会攒下文章标签；`nav.close_article()` 用的 Cmd+W 在这个
-    # Chromium 外壳里无效，得用「×」逐个清。列表模式下这一步是空操作。
-    _close_article(cfg, verbose=verbose)
     nav.to_feed(cfg, verbose=verbose, want="list")
 
-    row = find_account(cfg, name, verbose=verbose)
-    if row is None:
-        raise _fail(
-            f"左栏滚了 {ui.get('account_scan_rounds', 8)} 屏也没找到「{name}」。\n"
-            "  请确认号名写法（要和左栏显示的一致），或先把左栏滚到能看到它。")
-    open_account(cfg, row, name, verbose=verbose)
+    # 用户常常已经手工把目标号点开了（尤其上次中断后接着跑）。这时左栏
+    # 列表往往停在别的位置，再去扫 8 屏反而找不到、白停一轮；右栏页头
+    # 就是现成的、更可靠的「进对号了没」证据，和 open_account 的复验同源。
+    head = _pane_header(cfg)
+    if head and _name_hit(head.text, normalize(name), ui):
+        if verbose:
+            print(f"· 右栏已经是「{head.text}」，跳过左栏找号", flush=True)
+        row = AccountRow(name=head.text, x=0.0, y=0.0, title=head.text)
+    else:
+        row = find_account(cfg, name, verbose=verbose)
+        if row is None:
+            raise _fail(
+                f"左栏滚了 {ui.get('account_scan_rounds', 8)} 屏也没找到「{name}」。\n"
+                "  请确认号名写法（要和左栏显示的一致），或先把左栏滚到能看到它。")
+        open_account(cfg, row, name, verbose=verbose)
 
     bottom = scroll_to_bottom(cfg, verbose=verbose)
     urls: list[str] = []
@@ -855,15 +839,15 @@ def grab_account(cfg: dict, name: str, limit: int, *, verbose: bool = True,
             try:
                 url = grab_headline(cfg, hl, verbose=verbose)
             except Exception as exc:
-                partial_url = getattr(exc, "partial_url", None)
-                if partial_url and partial_url not in urls:
-                    urls.append(partial_url)
-                out = _write_urls(cfg, name, urls, partial=True)
+                got = list(urls)
+                already = getattr(exc, "partial_url", None)
+                if already and already not in got:
+                    got.append(already)
+                out = _write_urls(cfg, name, got, partial=True)
                 raise _fail(
                     f"取《{hl.title or '（无标题）'}》（{hl.ts}）时失败，已停止。\n"
-                    f"  本轮已取到 {len(urls)} 条（含已复制链接但关标签失败的"
-                    "那一条），留在 {out}（partial，"
-                    "**没有覆盖上一次成功的 _raw_urls 文件**，也未写任何台账）\n"
+                    f"  已取到 {len(got)} 条，写入 {out.name}（partial，"
+                    "主文件未改动、未写任何台账）\n"
                     f"  原因：{exc}")
             if url in urls:
                 skipped.append({"title": hl.title, "url": url,
@@ -875,9 +859,7 @@ def grab_account(cfg: dict, name: str, limit: int, *, verbose: bool = True,
                       f"{url}", flush=True)
         if len(urls) >= limit:
             break
-        # 连着几屏没新东西才到头。给 3 屏：会话页会懒加载，且偶尔有一屏
-        # 正好停在两张卡片之间、连时间行都看不见。
-        if idle >= int(ui.get("account_idle_rounds", 3)):
+        if idle >= 2:                        # 连着两屏没新东西 = 到头了
             if verbose:
                 print("· 再往上也没有新的推送了", flush=True)
             break

@@ -9,10 +9,11 @@ import unittest
 from src import winpos
 
 
-def _w(index, owner, x, y, w, h, *, layer=0, onscreen=True, wid=None):
+def _w(index, owner, x, y, w, h, *, layer=0, onscreen=True, wid=None,
+       name=""):
     return {"index": index, "id": wid if wid is not None else 1000 + index,
             "layer": layer, "onscreen": onscreen,
-            "x": x, "y": y, "w": w, "h": h, "owner": owner}
+            "x": x, "y": y, "w": w, "h": h, "owner": owner, "name": name}
 
 
 class TestFindWechat(unittest.TestCase):
@@ -24,6 +25,21 @@ class TestFindWechat(unittest.TestCase):
         ]
         main = winpos.find_wechat(ws)
         self.assertEqual(main["w"], 1280)
+
+    def test_title_beats_larger_article_window(self):
+        """文章浮窗面积更大时仍要认出主窗口（2026-11-08 实况）。
+
+        主窗口被恢复成 937x727（681k）后，比浮窗 1206x569（686k）小；
+        只按面积取最大会把浮窗当主窗口，`article_window_open` 恒 False，
+        grab 反复误判「点了没打开」。
+        """
+        ws = [
+            _w(0, "微信", 11, 158, 1206, 569, name="微信 (窗口)"),  # 文章浮窗
+            _w(1, "微信", 171, 30, 937, 727, name="微信"),          # 主窗口
+        ]
+        main = winpos.find_wechat(ws)
+        self.assertEqual(main["id"], 1001)
+        self.assertEqual(main["w"], 937)
 
     def test_none_when_no_window(self):
         self.assertIsNone(winpos.find_wechat([_w(0, "WorkBuddy", 0, 0, 100, 100)]))

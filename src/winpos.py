@@ -65,6 +65,7 @@ guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String:
 }
 for (i, w) in list.enumerated() {
     let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+    let name = w[kCGWindowName as String] as? String ?? ""
     let layer = (w[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
     let num = (w[kCGWindowNumber as String] as? NSNumber)?.intValue ?? 0
     let onscreen = (w[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
@@ -73,7 +74,7 @@ for (i, w) in list.enumerated() {
         return ((b[k] as? NSNumber)?.doubleValue) ?? 0
     }
     print("\(i)\t\(num)\t\(layer)\t\(onscreen ? 1 : 0)\t"
-          + "\(val("X"))\t\(val("Y"))\t\(val("Width"))\t\(val("Height"))\t\(owner)")
+          + "\(val("X"))\t\(val("Y"))\t\(val("Width"))\t\(val("Height"))\t\(owner)\t\(name)")
 }
 """
 
@@ -130,7 +131,8 @@ def windows(include_offscreen: bool = False) -> list[dict] | None:
                 "layer": int(parts[2]), "onscreen": parts[3] == "1",
                 "x": float(parts[4]), "y": float(parts[5]),
                 "w": float(parts[6]), "h": float(parts[7]),
-                "owner": "\t".join(parts[8:]),
+                "owner": parts[8],
+                "name": "\t".join(parts[9:]) if len(parts) > 9 else "",
             })
         except ValueError:
             continue
@@ -168,7 +170,14 @@ def main_display() -> dict | None:
 
 
 def find_wechat(ws: list[dict] | None) -> dict | None:
-    """微信主窗口 = 所有者含「微信/WeChat」、layer 0、面积最大的那个。"""
+    """微信主窗口 = 所有者含「微信/WeChat」、layer 0、标题为「微信」的那个。
+
+    **不能只按面积取最大**：本机实测主窗口标题恒为「微信」，而公众号文章
+    浮窗（同 layer 0、标题「微信 (窗口)」）面积可能**更大**。2026-11-08
+    实况：主窗口被恢复成 937x727（681k），浮窗 1206x569（686k）→ 面积
+    判据把浮窗当主窗口，`article_window_open` 恒 False，grab 反复误判
+    「点了没打开」最后停轮。标题认不出来时退回面积最大，保持旧行为。
+    """
     if not ws:
         return None
     cand = [w for w in ws
@@ -177,6 +186,10 @@ def find_wechat(ws: list[dict] | None) -> dict | None:
             and w["w"] >= 600 and w["h"] >= 400]
     if not cand:
         return None
+    exact = [w for w in cand
+             if (w.get("name") or "").strip() in ("微信", "WeChat")]
+    if exact:
+        return max(exact, key=lambda w: w["w"] * w["h"])
     return max(cand, key=lambda w: w["w"] * w["h"])
 
 

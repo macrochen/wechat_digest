@@ -3,10 +3,13 @@
 """wechat_digest 命令行入口。
 
 完整流程由 WorkBuddy 的 wechat-digest skill 编排（触发形态 A）：
-  capture → (Hy4 读图给坐标) → grab → scan → review（HTML 清单，人工勾选并
-  点「开始总结」）→ hydrate → (Hy4 分批并发总结，写 batch-N.md) → merge → publish
+  capture → (Hy4 读图给坐标) → grab → scan → [自动模式：scan 自己放行并接着
+  hydrate；人工模式：review 清单页勾选并点「开始总结」] → hydrate →
+  (Hy4 分批并发总结，写 batch-N.md) → merge → publish
 
-  review 之前不会取正文；没在清单页提交，hydrate 一律拒绝执行。
+  默认抓取窗口是「今天 + 昨天」共 2 个自然日（feed_days），默认自动放行
+  （auto_summary=1）。没在清单页提交、且自动模式没写放行信号时，
+  hydrate 一律拒绝执行 —— 闸门只有一个，看信号文件。
   本地控制台是「一个常驻服务、一个端口（默认 7777）」：/review 选文清单、
   /read 本地阅读、/settings 参数设置始终同址；提交后服务不退出。
   用户改动写 config/settings.local.json，优先级高于 config/settings.json。
@@ -27,11 +30,11 @@ import sys
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date as _Date, datetime, timedelta
 from pathlib import Path
 
-from . import (account, article, blacklist, grab, gui, nav, ocr, prompt,
-               publish, quality, review, selection)
+from . import (account, article, blacklist, grab, grab_review, gui, nav, ocr,
+               prompt, publish, quality, review, selection)
 from .config import (inbox_file, inbox_matches, load_settings,
                      pending_file, project_path)
 from .state import (ClaimLock, Offered, Published, Runs, Seen, dedup_similar,
@@ -147,31 +150,40 @@ def cmd_doctor(cfg, args) -> int:
         print(f"· ZenMark 令牌：可读（来源 {where}，值不显示）")
     except publish.PublishError as exc:
         print(f"  × {exc}"); ok = False
-    print(f"· 每批上限 {cfg['batch_size']} 篇 / 子代理并发 ≤{cfg['max_parallel']}"
-          f" / 相似度阈值 {cfg['dedup_threshold']}")
+    fs = int(cfg.get("feed_scope", 1))
+    fd = max(1, int(cfg.get("feed_days", 2)))
+    scope_desc = (f"最近 {fd} 个自然日（滚出窗口为止）" if fs
+                  else "按篇数上限")
+    print(f"· 抓取范围：{scope_desc}"
+          f"（feed_scope={fs}，feed_days={fd}，"
+          f"兜底上限 {cfg.get('max_articles')} 篇）")
     auto = int(cfg.get("auto_summary") or 0)
-    print(f"· 总结前确认："
-          f"{'自动放行（scan 出完候选池直接总结，不等清单页提交）' if auto else '人工确认（清单页点「开始总结」才放行）'}"
-          f"（auto_summary={auto}，可用 scan --confirm / --auto-summary 单轮覆盖）")
+    auto_desc = ("自动放行（scan 出完候选池直接接着 hydrate，"
+                 "不等清单页提交）" if auto
+                 else "人工确认（清单页点「开始总结」才放行）")
+    print(f"· 总结前确认：{auto_desc}"
+          f"（auto_summary={auto}，可用 scan --confirm / --no-hydrate 单轮覆盖）")
     print(f"· UI 坐标：更多 {tuple(cfg['ui']['more_button'])} / 复制链接 "
           f"{tuple(cfg['ui']['copy_link'])} / 关闭 {tuple(cfg['ui']['close_window'])}")
     print(f"· 点击前标题行校准："
           f"{'开启' if cfg['ui'].get('title_probe', 1) else '关闭'}"
           f"（向下搜索 {cfg['ui'].get('title_search_down', 45)}px，"
           f"防点到公众号名）")
-    # 按号抓取只用一处 OCR（左栏按号名找 + 认时间行），编不出来就直接拦，
-    # 否则会在「左栏滚了 8 屏没找到这个号」上浪费很久才发现是工具缺失。
+    # OCR 现在有两处用：按号抓取认号名/时间行，信息流认卡片推送时间判跨天。
+    # 编不出来时按号抓取会直接失败；信息流那条链不受影响（只是判不了跨天，
+    # 退回到篇数上限兜底）。
     ocr_ok = ocr.available()
-    print(f"· 按号抓取用的本地文字识别（macOS Vision）："
-          f"{'可用' if ocr_ok else '不可用'}")
+    print(f"· 本地文字识别（macOS Vision）：{'可用' if ocr_ok else '不可用'}"
+          f"（按号抓取认号名/时间行；信息流认卡片推送时间判跨天）")
     if not ocr_ok:
         print("  × 编不出 OCR 小工具（需要 swiftc / Xcode 命令行工具）；"
-              "`account` 子命令会因此失败，信息流那条链不受影响")
+              "`account` 子命令会因此失败，信息流那条链不受影响"
+              "（只是判不了跨天，退回篇数上限兜底）")
         ok = False
     print(f"· 列表模式坐标：左栏 x={tuple(ui.get('account_list_x', []))} / "
           f"行距 {ui.get('account_row_pitch')}px / "
           f"右栏起点 x={ui.get('account_pane_left')}")
-    print(f"· 按号抓取默认取 {cfg['max_articles']} 次推送的头条"
+    print(f"· 按号抓取默认取 {cfg.get('account_max_pushes', 20)} 次推送的头条"
           f"（一次推送多条只要第一条）")
     print("=== 自检结束（未发送任何网络请求、未改动台账）===")
     return EXIT_OK if ok else EXIT_ERROR
@@ -194,15 +206,22 @@ def cmd_grab(cfg, args) -> int:
     limit = args.limit if args.limit is not None else cfg["max_articles"]
     if limit <= 0:
         raise RuntimeError("抓取篇数必须大于 0")
+    resume = bool(getattr(args, "resume", False))
+    no_gate = bool(getattr(args, "no_gate", False))
+    # --resume 是「从头重抓补齐」，必须合并已有链接，不能覆盖掉上一轮的成果。
+    append = bool(args.append) or resume
     if args.auto:
         result = grab.grab_auto(cfg, limit, dry_run=args.dry_run,
-                                append=args.append)
+                                append=append, resume=resume,
+                                no_gate=no_gate)
     else:
         if not args.coords:
             raise RuntimeError("要么给 --coords，要么加 --auto 让程序自己找卡片")
         coords = grab.parse_coords(args.coords)
-        result = grab.grab(cfg, coords, limit, args.dry_run, args.append)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+        result = grab.grab(cfg, coords, limit, args.dry_run, append)
+    # 每屏明细已经写进 out/_grab_ledger-<date>.json，终端只打摘要。
+    shown = {k: v for k, v in result.items() if k != "screens"}
+    print(json.dumps(shown, ensure_ascii=False, indent=2))
     return EXIT_OK
 
 
@@ -213,13 +232,77 @@ def cmd_scroll(cfg, args) -> int:
     return EXIT_OK
 
 
+def _window_dates(target: str, days: int) -> list[str]:
+    """抓取窗口里的日期（YYYY-MM-DD），从新到旧；含基准日往前 N-1 天。
+
+    按**自然日**、北京时间 00:00 分界：2026-11-09 + 2 天 =
+    ["2026-11-09", "2026-11-08"]。日期格式不合法时退回「只认这一天」。
+    """
+    n = max(1, int(days))
+    try:
+        end = _Date.fromisoformat(target)
+    except (TypeError, ValueError):
+        return [str(target)]
+    return [(end - timedelta(days=i)).isoformat() for i in range(n)]
+
+
+def _filter_recent_days(articles: list[dict], target: str,
+                        days: int = 2) -> tuple[list[dict], list[dict]]:
+    """把「不在最近 N 个自然日窗口内」的文章剔出去，返回 (留下的, 被剔掉的)。
+
+    判据是服务端给的 `published_at`（北京时间，精确到分），不是抓取层
+    那个 OCR 猜的推送时间 —— 后者只用来决定「滚到哪儿停」。
+
+    **认不出发布时间的留下**：宁可多留一篇（它可能就在窗口内），也不误删。
+    N=1 等价于原来的「只留当天」。
+    """
+    allowed = set(_window_dates(target, days))
+    keep, out = [], []
+    for a in articles:
+        pub = str(a.get("published_at") or "").strip()
+        day = pub[:10] if len(pub) >= 10 else ""
+        if day and day not in allowed:
+            out.append(a)
+        else:
+            keep.append(a)
+    return keep, out
+
+
+def _grab_gate_blocks(date: str, scope: str, ignore: bool = False,
+                      *, verbose: bool = True) -> bool:
+    """grab → scan 的完备性闸门：有未解除的缺口就返回 True 拦住 scan。
+
+    只管信息流那条链：按号抓取（scope 非空 / --urls-file）是另一套数据源，
+    不受 grab_auto 的缺口影响。单轮 `--ignore-grab-gate` 会打印告警留痕。
+    """
+    if scope:
+        return False
+    if ignore:
+        if verbose:
+            print("· 本轮用 --ignore-grab-gate 绕过完备性闸门"
+                  "（未做缺口校验，已知风险）", flush=True)
+        return False
+    from . import grab_ledger
+    gate = grab_ledger.read_gate(date)
+    if not gate:
+        return False
+    cov = gate.get("coverage") or {}
+    if verbose:
+        print(f"⛔ 抓取完备性闸门：{date} 这轮抓取还缺 "
+              f"{cov.get('missing', '?')} 篇，scan 已拒绝执行。")
+        print(f"   缺口清单：{gate.get('missing_file')}")
+        print("   先跑 python3 -m src.main grab --auto --resume 补齐；"
+              "确需跳过用 scan --ignore-grab-gate（本轮留痕）")
+    return True
+
+
 def cmd_scan(cfg, args) -> int:
     """从 raw urls 建候选池：只取元信息，不下载正文。
 
-    默认走人工确认：出完候选池打开清单页，等人点「开始总结」。
-    配置 auto_summary=1 或加 --auto-summary 时改为自动模式：候选池落盘后
-    立即写选文清单（全选）+ 放行信号（mode=auto），不打开清单页，
-    下一步直接 hydrate；加 --confirm 可只压掉本轮。
+    默认（auto_summary=1）自动放行：候选池落盘后写「全选清单 + 放行信号」
+    （mode=auto），不弹清单页，**接着直接跑 hydrate** 取正文 —— 抓完即总结，
+    不等人工确认。`--confirm` 压回人工确认（等清单页提交）、`--no-hydrate`
+    只出候选池、`--days N` 只改本次抓取窗口。
     """
     raw_path = Path(args.urls_file).expanduser() if args.urls_file else \
         project_path("out", "_raw_urls.json")
@@ -244,7 +327,17 @@ def cmd_scan(cfg, args) -> int:
         if scope:
             print(f"· 从链接文件名推断 scope={scope}（按号抓取的那份）")
     key = f"{date}-{scope}" if scope else date
+    # 完备性闸门：信息流那条链（无 scope、非 --urls-file）才检查。
+    # 按号抓取是另一套数据源，不受 grab_auto 的缺口影响。
+    if _grab_gate_blocks(date, scope,
+                         getattr(args, "ignore_grab_gate", False)):
+        return EXIT_ERROR
     run_key = _run_key(date, urls, scope)
+    day_arg = getattr(args, "days", None)
+    feed_days = max(1, int(day_arg if day_arg is not None
+                           else cfg.get("feed_days", 2)))
+    window = _window_dates(date, feed_days)
+    window_start = window[-1]
     runs = Runs()
     done = runs.done(run_key)
     if done:
@@ -311,6 +404,22 @@ def cmd_scan(cfg, args) -> int:
         for a in chatty:
             print(f"    - {(a.get('source') or '（无公众号名）')}  "
                   f"{a.get('reason')}", file=sys.stderr)
+    # 「最近 N 天全部」模式：只留抓取窗口内推送的文章。
+    # **必须排在 offered.mark 之前** —— 否则窗口外的文章被记成「投递过」，
+    # 下次重扫会被 skipped_offered 挡掉，就再也补不回来了。
+    # 字段名 skipped_notoday 沿袭旧版（正文 / 清单页 / 台账都可能读它），
+    # 现在装的是「不在这 N 天窗口内」的文章。
+    skipped_notoday: list[dict] = []
+    if int(cfg.get("feed_scope", 1)) and not scope:
+        articles, skipped_notoday = _filter_recent_days(articles, date,
+                                                        feed_days)
+        if skipped_notoday:
+            print(f"· 不在抓取窗口（{window_start} ~ {date}，共 {feed_days} 天）"
+                  f"的文章：跳过 {len(skipped_notoday)} 篇", file=sys.stderr)
+            for a in skipped_notoday:
+                print(f"    - {a.get('published_at','?')}  "
+                      f"{a.get('source','?')}  《{a.get('title','?')}》",
+                      file=sys.stderr)
     # 过滤后重新连续编号，清单页的 data-i / select --ids 依赖它
     for i, a in enumerate(articles, 1):
         a["index"] = i
@@ -321,17 +430,31 @@ def cmd_scan(cfg, args) -> int:
         # key = 落盘用的路径键（带 scope）；account = 号名，发布标题要用
         "scope": scope, "key": key, "account": scope,
         "max_articles": limit,
+        # 抓取窗口（含基准日往前 feed_days 个自然日），可观测：
+        "feed_days": feed_days,
+        "window_start": window_start, "window_end": date,
         "articles": articles,
         "failed_meta": failed,
         "skipped_seen": skipped_seen,
         "skipped_offered": skipped_offered,
         "skipped_blacklist": blocked,
         "skipped_notitle": chatty,
+        "skipped_notoday": skipped_notoday,
         "blacklist": names,
         "_note": "phase=scan：只有元信息，没有正文；hydrate 之后才取正文",
     }
     p = _inbox_path(date, scope)
     save_json(p, inbox)
+    # 抓取明细（`/grab` 页的数据源）：必须排在 offered.mark **之前**，
+    # 否则本轮刚进清单的文章会被写进台账、被误算成「跨轮重复」。
+    # 纯读盘 + 写自己的明细文件，失败只警告，绝不影响 scan 主流程。
+    try:
+        rp, rv = grab_review.write(date, scope, out_dir=p.parent)
+        s = rv["summary"]
+        print(f"· 本轮文章明细：{rp.name}（页面只列进本轮清单的 "
+              f"{s['in_inbox']} 篇，已处理过的不会出现）")
+    except Exception as exc:  # noqa: BLE001 - 展示层不能拖垮抓取链路
+        print(f"· 抓取明细没写成功（不影响本轮）：{exc}", file=sys.stderr)
     # 真正进了清单的才算「投递过」：黑名单 / 元信息失败的不记，将来还能重抓
     if articles:
         offered.mark(articles, run_key, date)
@@ -342,13 +465,21 @@ def cmd_scan(cfg, args) -> int:
     print(f"  新文章 {len(articles)} 篇 / 元信息失败 {len(failed)} 篇"
           f" / 已总结过 {len(skipped_seen)} 篇"
           f" / 已投递未选 {len(skipped_offered)} 篇"
-          f" / 黑名单排除 {len(blocked)} 篇")
+          f" / 黑名单排除 {len(blocked)} 篇"
+          + (f" / 窗口外 {len(skipped_notoday)} 篇" if skipped_notoday else ""))
     if not articles:
-        print("· 本轮没有可总结的文章（可能被黑名单排完或元信息全失败），出不了清单")
+        if skipped_notoday and not failed and not blocked and not chatty:
+            print(f"· 这批链接没有一篇落在抓取窗口（{window_start} ~ {date}）"
+                  "内，已全部剔出。要出更早那天的简报就加 "
+                  "--date <那天> --days 1；想放宽窗口就加 --days 3。")
+        else:
+            print("· 本轮没有可总结的文章（可能被黑名单排完或元信息全失败），出不了清单")
     for a in articles:
         print(f"  {a['index']:>2}. {a.get('published_at','时间未知')}  "
               f"{a.get('source','?')}  《{a['title']}》")
-    print(f"· 本轮抓取上限 {limit} 篇（实际取到 {len(articles)} 篇）")
+    print(f"· 本轮抓取上限 {limit} 篇（实际取到 {len(articles)} 篇）"
+          + ("；已按最近 " + str(feed_days) + " 天（"
+             + window_start + " ~ " + date + "）过滤" if skipped_notoday else ""))
 
     # 自动模式：由 scan 代写「选文清单 + 放行信号」，hydrate 的校验逻辑一字不改。
     # 不加旁路分支，是为了让「谁授权的」永远只有一个答案——看信号文件。
@@ -361,8 +492,15 @@ def cmd_scan(cfg, args) -> int:
               f"（{req['requested_at']}，未经人工确认）", flush=True)
         print("  只跳过「人选哪几篇」：黑名单 / 无标题过滤 / 相似度去重 / "
               "投递台账一律照旧")
-        print("· 下一步：python3 -m src.main hydrate（不用去清单页提交）")
-        return EXIT_OK
+        if getattr(args, "no_hydrate", False):
+            print("· 本轮 --no-hydrate：停在候选池；下一步 "
+                  "python3 -m src.main hydrate（信号已写好，不用去清单页）")
+            return EXIT_OK
+        # 抓完直接总结：同一条命令里接着取正文。这里**不是**绕过闸门，
+        # hydrate 仍然只读刚写下的那个信号文件，校验一行没放宽。
+        print("· 抓完直接总结：接着跑 hydrate 取正文（闸门仍只认上面那个信号）",
+              flush=True)
+        return cmd_hydrate(cfg, args)
 
     if not articles:
         return EXIT_OK  # 上面已经说清「本轮没有可总结的文章」，不再提下一步
@@ -390,7 +528,9 @@ def cmd_account(cfg, args) -> int:
         return EXIT_OK
     limit = args.limit
     if limit is None:
-        limit = int(cfg["max_articles"])
+        # 按号抓取走自己的配置：信息流那条链改成「最近 N 天全部」不影响这里
+        # 「最近 N 次推送的头条」的原语义。
+        limit = int(cfg.get("account_max_pushes", 20))
     print(f"=== 按号抓取：{name}（最多 {limit} 次推送的头条）===")
     print("  步骤：切列表模式 → 左栏找号 → 点开 → 滚到底 → 从下往上逐条取链接")
     result = account.grab_account(
@@ -835,10 +975,15 @@ def cmd_status(cfg, args) -> int:
         "runs": Runs().data,
         "published": Published().data,
         "lock": ClaimLock().owner(),
-        # 当前生效的确认方式：agent 用它决定「等人点提交」还是「直接往下跑」
+        # 当前生效的确认方式与抓取窗口：agent 用它决定「等人点提交」还是
+        # 「直接往下跑」，以及这批覆盖哪几天
         "auto_summary": int(cfg.get("auto_summary") or 0),
+        "feed_days": max(1, int(cfg.get("feed_days", 2))),
         "inbox": None if not inbox else {
             "date": inbox["date"], "run_key": inbox["run_key"],
+            "feed_days": inbox.get("feed_days"),
+            "window_start": inbox.get("window_start"),
+            "window_end": inbox.get("window_end"),
             "scope": inbox.get("scope") or "",
             "phase": inbox["phase"],
             "submitted": req is not None,
@@ -879,10 +1024,16 @@ def build_parser():
     p.add_argument("--auto", action="store_true",
                    help="全自动：自己点「公众号」入口进信息流、逐张点开、滚动翻页")
     p.add_argument("--limit", type=int, default=None,
-                   help="本轮最多复制几条链接，默认取 settings.json 的 max_articles")
+                   help="本轮最多复制几条链接，默认取 settings.json 的 "
+                        "max_articles（窗口全部模式下只是兜底上限）")
     p.add_argument("--append", action="store_true",
                    help="分多屏抓时，把本轮链接合并进已有的 _raw_urls.json")
     p.add_argument("--dry-run", action="store_true", help="只校验环境与坐标，不点击")
+    p.add_argument("--resume", action="store_true",
+                   help="带上轮缺口清单从头重抓补齐（隐含 --append）；"
+                        "重新对账 K=0 才解除完备性闸门")
+    p.add_argument("--no-gate", dest="no_gate", action="store_true",
+                   help="本轮不写完备性阻断标记（调试用，缺口照旧记进台账）")
 
     p = sub.add_parser(
         "account",
@@ -890,7 +1041,8 @@ def build_parser():
     p.add_argument("--name", required=False, default=None,
                    help="公众号名，要和列表模式左栏显示的一致（如 EarlETF）")
     p.add_argument("--limit", type=int, default=None,
-                   help="最多取几次推送的头条，默认取 settings.json 的 max_articles")
+                   help="最多取几次推送的头条，默认取 settings.json 的 "
+                        "account_max_pushes")
     p.add_argument("--probe", action="store_true",
                    help="只看不点：打印当前形态、左栏号名、右栏头条，排查定位用")
     p.add_argument("--keep-list", dest="keep_list", action="store_true",
@@ -907,7 +1059,13 @@ def build_parser():
     p.add_argument("--urls-file", default=None)
     p.add_argument("--date", default=None)
     p.add_argument("--max-articles", type=int, default=None,
-                   help="本轮抓取篇数上限，默认取 settings.json 的 max_articles")
+                   help="本轮抓取篇数上限，默认取 settings.json 的 max_articles"
+                        "（窗口全部模式下只是兜底上限）")
+    p.add_argument("--days", type=int, default=None,
+                   help="本轮抓取窗口：含 --date（默认今天）往前共 N 个自然日，"
+                        "默认取 settings.json 的 feed_days（2 = 今天 + 昨天）；"
+                        "给 1 就退回「只抓当天」。只改 scan 层过滤，"
+                        "GUI 滚动停止读配置里的 feed_days")
     p.add_argument("--include-offered", action="store_true",
                    help="连上次进过清单但没勾选的文章也一起进清单（默认过滤掉）")
     p.add_argument("--port", type=int, default=7777,
@@ -916,10 +1074,16 @@ def build_parser():
                    help="出完候选池不自动打开浏览器清单页")
     p.add_argument("--auto-summary", dest="auto_summary",
                    action="store_const", const=1, default=None,
-                   help="本轮跳过人工确认：出完候选池自动全选并代写放行信号，"
-                        "随后可直接 hydrate（只覆盖本次，不改配置）")
+                   help="本轮跳过人工确认（默认就是自动）：出完候选池自动全选、"
+                        "代写放行信号并接着 hydrate（只覆盖本次，不改配置）")
     p.add_argument("--confirm", action="store_true",
-                   help="本轮强制人工确认，压掉配置里的 auto_summary=1")
+                   help="本轮强制人工确认，压掉默认/配置里的 auto_summary=1")
+    p.add_argument("--no-hydrate", dest="no_hydrate", action="store_true",
+                   help="自动模式下只出候选池和放行信号，不接着跑 hydrate"
+                        "（分步排查用；闸门不变）")
+    p.add_argument("--ignore-grab-gate", dest="ignore_grab_gate",
+                   action="store_true",
+                   help="单轮绕过抓取完备性闸门（有缺口也放行，会打印告警留痕）")
 
     p = sub.add_parser("review", help="生成 HTML 清单页，等人工勾选并提交")
     p.add_argument("--port", type=int, default=7777)
@@ -974,6 +1138,11 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true", help="不发送请求、不改台账")
     p.add_argument("--check", action="store_true", help="只读验令牌")
 
+    p = sub.add_parser("grab-review",
+                       help="生成/刷新抓取明细（全部链接的去向与重复情况，供 /grab 页查看）")
+    p.add_argument("--date", default=None, help="默认今天")
+    p.add_argument("--scope", default="", help="按号抓取的命名空间")
+
     sub.add_parser("status", help="查看台账与批次进度")
 
     # scope 命名空间：按号抓取出来的那份候选池与信息流那份各走各的路
@@ -989,6 +1158,22 @@ def build_parser():
     return ap
 
 
+def cmd_grab_review(cfg, args) -> int:
+    """刷新 `/grab` 页的数据源。只读台账，不取正文、不放行总结。"""
+    date = args.date or _today()
+    scope = str(getattr(args, "scope", "") or "")
+    p, data = grab_review.write(date, scope)
+    s = data["summary"]
+    print(f"✓ 抓取明细：{p}")
+    print(f"  抓到 {s['total']} 条 / 唯一 URL {s['unique_urls']} 条"
+          f" / URL 重复组 {s['url_dup_groups']} / 标题重复组 {s['title_dup_groups']}"
+          f" / 跨轮重复 {s['cross_round']} 条 / 进本轮清单 {s['in_inbox']} 条")
+    for k, v in sorted((s["counts"] or {}).items()):
+        print(f"    - {grab_review.STATUS_LABELS.get(k, k)}: {v} 条")
+    print(f"· 打开 http://127.0.0.1:7777/grab?scope={scope or ''} 查看")
+    return EXIT_OK
+
+
 HANDLERS = {
     "doctor": cmd_doctor, "capture": cmd_capture, "nav": cmd_nav,
     "grab": cmd_grab, "account": cmd_account,
@@ -999,6 +1184,7 @@ HANDLERS = {
     "hydrate": cmd_hydrate, "batches": cmd_batches, "merge": cmd_merge,
     "voice-input": cmd_voice_input,
     "publish": cmd_publish, "status": cmd_status,
+    "grab-review": cmd_grab_review,
 }
 
 

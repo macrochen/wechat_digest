@@ -84,16 +84,24 @@ def article_window_open(cfg: dict) -> bool | None:
 
 
 def close_article(cfg: dict, *, tries: int = 2) -> bool:
-    """关掉前面的文章窗口；前面不是文章窗口就什么都不做。"""
+    """关掉前面的文章窗口；前面不是文章窗口就什么都不做。
+
+    **只对独立浮窗发 Cmd+W**。2026-11-08 22:5x 实测：微信最大化/全屏时，
+    文章开在主窗口的标签页里，此时 Cmd+W 的语义是**关掉整个微信窗口**
+    （进程还在、窗口消失，只能 `open -a WeChat` 捞回来），不是关标签。
+    `article_window_open` 在标签页形态下恒返回 False，这里正好直接 return，
+    不会盲按。所以这个形态必须靠「退出全屏」解决，不能靠快捷键。
+    """
     ui = cfg["ui"]
     for _ in range(max(1, tries)):
         state = article_window_open(cfg)
         if state is False:                 # 已经回到主窗口，不用关
             return True
-        if state is None:                  # 拿不到窗口信息，退回原行为
-            gui.cmd_key(13)
-            _sleep(ui.get("close_wait", 1.8))
-            return True
+        if state is None:
+            # 拿不到窗口信息 = 不知道快捷键会打给谁。**绝不能盲按**：
+            # 2026-11-08 实测两次，盲按 Cmd+W 都关掉了微信主窗口。宁可不关，
+            # 让调用方按「关不掉」处理（文章链接通常已经拿到了）。
+            return False
         ensure_focus(cfg, verbose=False)
         gui.cmd_key(13)                    # 13 = kVK_ANSI_W
         _sleep(ui.get("close_wait", 1.8))
@@ -123,6 +131,7 @@ def read_cards(cfg: dict, image_path: str | Path = _NAV_SHOT) -> list[feed_visio
         weak_min_peak=ui.get("card_weak_min_peak", 26),
         weak_min_gap=ui.get("card_weak_min_gap", 90),
         left_align_tol=ui.get("card_left_align_tol", 14),
+        dynamic_weak_gap=bool(ui.get("card_dynamic_weak_gap", 0)),
     )
 
 
@@ -705,32 +714,49 @@ def to_feed(cfg: dict, *, tries: int | None = None,
         "请把微信主窗口最大化、把左侧列表滚到能看到「公众号」那一行，再重跑。")
 
 
+def _at_feed(cfg: dict) -> bool:
+    """界面确实停在公众号**卡片流**，而不是文章页 / 号列表。
+
+    只看 `len(read_cards) >= 2` 会把文章页误判成卡片流：文章页里的加粗
+    文字同样能扫出两条「标题带」（2026-11-09 实盘 y≈281 / 508）。
+    所以先用窗口几何挡一道（前面还是独立文章窗就不算），再用左栏
+    存在性挡掉列表模式。
+    """
+    if article_window_open(cfg) is True:   # 前面还是独立文章窗，没关掉
+        return False
+    try:
+        shot = _shot(cfg)
+        cards = read_cards(cfg, shot)
+    except Exception:
+        return False
+    if left_pane_present(cfg, shot) or looks_like_account_list(cards):
+        return False
+    return len(cards) >= 2
+
+
 def recover(cfg: dict) -> bool:
     """点错 / 弹窗后把界面拉回信息流。
 
     先 Cmd+W 关掉误开或没加载完的文章标签（微信的文章页是同一个多标签
-    窗口里的新标签），再确认是否回到信息流；没回去就重新走一次导航。
-    返回 True 表示现在确实停在信息流。
+    窗口里的新标签），再**复验**是否真的回到卡片流；没回去就重新走一次
+    导航并再复验一次。返回 True 表示现在确实停在信息流。
 
-    「号列表」形态不算回到信息流（一行一个号、点标题不开文章），照旧
-    尝试重新导航，失败返回 False。
+    2026-11-09 修：旧版只看「扫到 ≥2 条标题带」就 return True，文章页
+    也能满足；`to_feed()` 之后更是无条件 return True。结果广告卡跳过后
+    界面还停在文章页，下一张被标题带守卫拒绝盲点，凑满连续 2 次失败
+    误报退出码 3。现在两处都必须过 `_at_feed()`。
     """
     try:
         close_article(cfg)                 # 只在前面确实是文章窗口时才关
     except Exception:                      # 关窗失败不该盖掉原始错误
         pass
-    try:
-        shot = _shot(cfg)
-        cards = read_cards(cfg, shot)
-        if len(cards) >= 2 and not looks_like_account_list(cards):
-            return True
-    except Exception:
-        pass
+    if _at_feed(cfg):
+        return True
     try:
         to_feed(cfg, verbose=False)
-        return True
     except Exception:
         return False
+    return _at_feed(cfg)
 
 
 def nav(cfg: dict, *, out: str | None = None) -> dict:

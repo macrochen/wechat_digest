@@ -376,6 +376,7 @@ def find_card_titles(image_path: str | Path, *,
                      weak_min_peak: int = 26,
                      weak_min_gap: float = 90,
                      left_align_tol: float = 14,
+                     dynamic_weak_gap: bool = False,
                      ) -> list["CardTitle"]:
     """找信息流里每张卡片的标题落点（含横向范围），供自动点击使用。
 
@@ -413,6 +414,15 @@ def find_card_titles(image_path: str | Path, *,
 
     weak: list[Band] = []
     if weak_min_peak > 0:
+        # 固定 90px 会把「紧挨着强标题的短标题」当成同一张卡的小字丢掉。
+        # 动态判据按本屏实际卡片间距缩放（0.6 倍、至少 40px）。
+        gap = float(weak_min_gap)
+        if dynamic_weak_gap and len(strong) >= 2:
+            centers = sorted(b.center for b in strong)
+            intervals = sorted(b - a for a, b in zip(centers, centers[1:])
+                               if b > a)
+            if intervals:
+                gap = max(40.0, 0.6 * intervals[len(intervals) // 2])
         strong_x0 = [_band_xrange(img, b, threshold, x_lo, x_hi)[0]
                      for b in strong]
         left_edge = (sum(strong_x0) / len(strong_x0)) if strong_x0 else None
@@ -425,7 +435,7 @@ def find_card_titles(image_path: str | Path, *,
                 if abs(bx0 - left_edge) > left_align_tol:
                     continue
             if strong and min(abs(b.center - s.center) for s in strong) \
-                    < weak_min_gap:
+                    < gap:
                 continue
             weak.append(b)
 
@@ -832,3 +842,84 @@ def snap(image_path: str | Path, y: float, *,
     return Calibration(y, best.center, status,
                        f"全屏匹配{word}到标题行 y≈{best.center:.0f}"
                        f"（峰值 {best.peak}，跳过已点过的）")
+
+
+def measure_shift(prev_png: str | Path, cur_png: str | Path, *,
+                  x0: int = FEED_LEFT, x1: int = FEED_RIGHT,
+                  band_h: int = 48, search_px: int = 760, step: int = 4,
+                  threshold: int = DARK_THRESHOLD,
+                  max_row_diff: int = 6,
+                  logical_height: int | None = None) -> int | None:
+    """测两张相邻屏截图之间内容**向上**移动了多少像素（= 向下滚动的位移）。
+
+    以前 `gui.scroll(..., -12)` 只发「行数」，程序从来不知道实际滚了多少
+    像素；一旦跨过整屏，中间的卡片就永久漏掉。这里把标题列每一行的暗
+    像素数压成一维 profile，取上一屏中部几条带在下一屏沿 y 轴滑窗做 L1
+    匹配，多条带取中位数 —— 纯 Python + 已有的 `decode_png`，不引入
+    OpenCV / numpy。
+
+    * x0/x1 是**图像像素**坐标（真实截图默认 500..880 即标题列；
+      合成小图由测试自己传）。
+    * `logical_height` 给了就把图像像素位移换算成逻辑像素。
+    * 返回 None = 认不出（尺寸不同 / 内容整体变了 / 条带太干净 /
+      多条带结果不一致），调用方按「位移不可信」处理并强制补扫。
+    """
+    try:
+        prev = decode_png(prev_png, max_col=int(x1) + 8)
+        cur = decode_png(cur_png, max_col=int(x1) + 8)
+    except (OSError, ValueError):
+        return None
+    if prev.h != cur.h or prev.ch != cur.ch or prev.h < band_h * 3:
+        return None
+    h = prev.h
+    px1 = min(int(x1), prev.w)
+    px0 = max(0, min(int(x0), px1 - 1))
+    if px1 - px0 < 16:
+        return None
+
+    def profile(img: Image) -> list[int]:
+        return [_dark_count(img, y, px0, px1, threshold) for y in range(h)]
+
+    try:
+        prev_prof = profile(prev)
+        cur_prof = profile(cur)
+    except (IndexError, ValueError):
+        return None
+    scale = (logical_height / h) if logical_height else 1.0
+    search = int(search_px / (prev.sy or 1.0))
+    st = max(1, int(step))
+    shifts: list[float] = []
+    # 条带要取**屏幕偏下部**：向下滚 265~600px 后，上一屏下半部的内容
+    # 才会出现在下一屏里。取 0.55 那条最多只能测到 0.55×屏高，大位移时
+    # 它会投出一张伪票，把多条带的一致性判据打散，故统一取更靠下的三条。
+    for frac in (0.70, 0.80, 0.88):
+        y0 = min(int(h * frac), h - band_h)   # 保证 cand+band_h 不越界
+        seg = prev_prof[y0:y0 + band_h]
+        if len(seg) < band_h or max(seg) - min(seg) < 12:
+            continue                     # 整条都是空白，匹配没有意义
+        lo = max(0, y0 - search)
+
+        def score_at(cand: int) -> float:
+            return sum(abs(seg[k] - cur_prof[cand + k])
+                       for k in range(band_h))
+
+        best_score, best_cand = None, None
+        for cand in range(lo, y0 + 1, st):
+            score = score_at(cand)
+            if best_score is None or score < best_score:
+                best_score, best_cand = score, cand
+        # 粗搜步长会跳过奇数位移（甚至整像素），在最优解附近逐像素细化
+        if best_cand is not None and st > 1:
+            for cand in range(max(lo, best_cand - st),
+                              min(y0, best_cand + st) + 1):
+                score = score_at(cand)
+                if score < best_score:
+                    best_score, best_cand = score, cand
+        if best_cand is not None and best_score <= band_h * max_row_diff:
+            shifts.append((y0 - best_cand) * scale)
+    if len(shifts) < 2:
+        return None
+    shifts.sort()
+    if shifts[-1] - shifts[0] > 24 * max(scale, 0.1):
+        return None                      # 条带之间不一致，多半是内容被插入
+    return round(shifts[len(shifts) // 2])
